@@ -162,33 +162,6 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
                   (proof-interrupt-process))
               (error nil)))))))))
 
-(defun rocqagent_interrupt (&optional filename hard)
-  "Interrupt the active rocqagent operation.
-
-If FILENAME is non-nil, it must match the active operation's file.
-With HARD non-nil, escalate from a soft interrupt to killing the tracked
-subprocess or restarting the proof shell.
-
-This is intended for use from inside the same Emacs process.  For shell-side
-interrupts while `emacsclient' is blocked in a long rocqagent call, prefer the
-status-file cancel token exposed by `rocqagent_status_path'."
-  (interactive)
-  (let ((file (and filename (expand-file-name filename))))
-    (cond
-     ((not rocqagent--active-kind)
-      (list :ok nil :error "No active rocqagent operation"))
-     ((and file (not (equal file rocqagent--active-file)))
-      (list :ok nil
-            :error (format "Active rocqagent operation is for %s, not %s"
-                           rocqagent--active-file
-                           file)))
-     (t
-      (rocqagent--signal-interrupt hard)
-      (list :ok t
-            :kind rocqagent--active-kind
-            :file rocqagent--active-file
-            :hard (and hard t))))))
-
 (defun rocqagent--maybe-handle-cancel (&optional buf proc)
   "Abort the current operation if cancellation has been requested."
   (when (rocqagent--external-cancel-requested-p)
@@ -697,5 +670,8 @@ Return shape:
                 (set-visited-file-modtime)
                 (set-buffer-modified-p nil)))))
       (kill-buffer tmp))))
+
+(when (fboundp 'rocqagent_interrupt)
+  (fmakunbound 'rocqagent_interrupt))
 
 (provide 'rocqagent)
