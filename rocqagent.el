@@ -339,31 +339,46 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
   (cl-labels
       ((extract-error (text)
          (let ((clean (string-trim (or text ""))))
-           (if (string-match "Error:" clean)
-               (let ((start 0)
-                     (scan 0))
-                 (while (string-match "Error:" clean scan)
-                   (setq start (match-beginning 0))
-                   (setq scan (1+ start)))
-                 (string-trim (substring clean start)))
-             clean))))
+           (cond
+            ((string-match "Error:" clean)
+             (let ((start 0)
+                   (scan 0))
+               (while (string-match "Error:" clean scan)
+                 (setq start (match-beginning 0))
+                 (setq scan (1+ start)))
+               (string-trim (substring clean start))))
+            ((string-match "Anomaly:" clean)
+             (string-trim clean))
+            ((string-match "Exception:" clean)
+             (string-trim clean))
+            (t
+             nil)))))
     (let* ((raw proof-shell-last-output)
            (shell-text (and (stringp raw)
                             (string-trim
                              (if (fboundp 'proof-shell-strip-output-markup)
                                  (proof-shell-strip-output-markup raw)
-                               raw)))))
+                               raw))))
+           (shell-error (extract-error shell-text)))
       (cond
-       ((and shell-text (> (length shell-text) 0))
-        (extract-error shell-text))
+       ((and shell-error (> (length shell-error) 0))
+        shell-error)
        ((buffer-live-p proof-response-buffer)
         (with-current-buffer proof-response-buffer
-          (extract-error
-           (buffer-substring-no-properties (point-min) (point-max)))))
+          (let ((response-text
+                 (string-trim
+                  (buffer-substring-no-properties (point-min) (point-max)))))
+            (or (extract-error response-text)
+                (and (> (length response-text) 0) response-text)))))
        ((get-buffer "*compile-deps-dune*")
         (with-current-buffer "*compile-deps-dune*"
-          (extract-error
-           (buffer-substring-no-properties (point-min) (point-max)))))
+          (let ((dune-text
+                 (string-trim
+                  (buffer-substring-no-properties (point-min) (point-max)))))
+            (or (extract-error dune-text)
+                (and (> (length dune-text) 0) dune-text)))))
+       ((and shell-text (> (length shell-text) 0))
+        shell-text)
        (t
         "Unknown Coq error")))))
 
