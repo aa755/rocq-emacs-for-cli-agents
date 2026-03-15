@@ -40,7 +40,18 @@ Return value:
 Semantics:
 - The caller must first establish the checked state with `coqcheck_until`.
 - The query is sent directly to Coq through Proof General; it is not inserted into the file.
-- If the query changes the checked boundary unexpectedly, the API rewinds and returns an error.
+
+Allowed query prefixes:
+- `Search`
+- `SearchAbout`
+- `SearchPattern`
+- `About`
+- `Print`
+- `Locate`
+- `Check`
+- `Compute`
+- `Eval`
+- `Show`
 
 ## `save-file`
 
@@ -57,17 +68,6 @@ Semantics:
 - If no live buffer exists, do nothing and return success.
 - This is intended as a pre-edit sync helper before shell-side edits.
 
-Allowed query prefixes:
-- `Search`
-- `SearchAbout`
-- `SearchPattern`
-- `About`
-- `Print`
-- `Locate`
-- `Check`
-- `Compute`
-- `Eval`
-- `Show`
 
 ## Interrupting a long-running request
 
