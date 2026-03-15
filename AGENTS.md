@@ -1,18 +1,12 @@
 # Rocq Emacs API for CLI Agents
-
 This repository exposes a small Emacs/Proof-General API for interactive Rocq/Coq checking from CLI agents.
 
 ## Entry points
 
 - `coqcheck_until(filename, linenum, columnnum, restart)`
 - `coqquery_at_curpoint(query, filename)`
+- `save-file(filename)`
 - `rocqagent_status_path()`
-
-## Requirements
-
-- Emacs with Proof General loaded
-- Rocq/Coq mode active for `.v` files
-- A Dune workspace for `restart=t`
 
 ## `coqcheck_until`
 
@@ -29,8 +23,9 @@ Return value:
 Semantics:
 - If processing fails at or before the requested point, the function returns `:ok nil` with the Coq error.
 - If `linenum` and `columnnum` are both `nil`, the target is the end of the file.
-- With `restart=nil`, the function reloads the current buffer from disk incrementally before checking.
+- With `restart=nil`, the function reloads the current buffer from disk incrementally before checking: the "checked-region" only reverts till the first character that was changed.
 - With `restart=t`, the file must live under a Dune workspace.
+- At end of file there is usually no open proof, so `:goal` may contain the `Show.` error text rather than a useful goal state.
 
 ## `coqquery_at_curpoint`
 
@@ -46,6 +41,21 @@ Semantics:
 - The caller must first establish the checked state with `coqcheck_until`.
 - The query is sent directly to Coq through Proof General; it is not inserted into the file.
 - If the query changes the checked boundary unexpectedly, the API rewinds and returns an error.
+
+## `save-file`
+
+Arguments:
+- `filename`: absolute path to the `.v` file
+
+Return value:
+- success with no live buffer: `(:ok t :file FILE :buffer-live nil :saved nil)`
+- success with live buffer: `(:ok t :file FILE :buffer-live t :saved BOOL :modified BOOL)`
+- failure: `(:ok nil :error STRING)`
+
+Semantics:
+- If Emacs already has a live buffer visiting `filename`, save that buffer.
+- If no live buffer exists, do nothing and return success.
+- This is intended as a pre-edit sync helper before shell-side edits.
 
 Allowed query prefixes:
 - `Search`
@@ -87,4 +97,29 @@ The running request polls for the cancel token and returns:
 emacsclient --eval '(coqcheck_until "/abs/path/file.v" 120 4 nil)'
 emacsclient --eval '(coqcheck_until "/abs/path/file.v" nil nil t)'
 emacsclient --eval '(coqquery_at_curpoint "Check nat." "/abs/path/file.v")'
+emacsclient --eval '(save-file "/abs/path/file.v")'
 ```
+
+## Optimal Usage pattern:
+- Before shell-side edits to a `.v` file, call `save-file` with the absolute path.
+- For query output (`Search`/`Locate`/`Print`/...), first call `coqcheck_until` to the desired point, then call `coqquery_at_curpoint`.
+- Dont edit files via emacs/emacsclient, just use this to see goal at point, or to see errors
+- For large Coq files (e.g. >1000 lines), do not use `dune build` during iterative editing/debugging; use the Emacs Coq API (`coqcheck_until` / `coqquery_at_curpoint`) instead. Use `dune` for these files only as an explicit final verification step when requested.
+- When all edits are done and `coqcheck_until(file, nil, nil, nil)` says no error, do use `dune` for a final check before telling the user that the task is done.
+- In a very large proof, make edits as close as possible to the end of the currently checked region to minimize rechecking.
+  Example: introduce temporary local lemmas near that point (e.g., with `Set Nested Proofs Allowed`) instead of adding global lemmas far above.
+- In a very large proof, when you want to keep the ability to rewind to earlier points cheaply, do not check through the proof terminator (`Qed.`/`Abort.`/`Admitted.`).
+  Check only up to just before the terminator.
+- Line numbers can become stale after edits. Before boundary checks near `Qed.`/`Abort.`/`Admitted.`, re-read the file with line numbers and recompute the exact target line.
+- When working on a large proof, make helper edits as locally as possible near the current proof point instead of near the top of the file. Prefer local nested lemmas or local `assert` blocks over top-level helper insertions that force long rechecks.
+- If a large proof needs local nested helper lemmas, use `Set Nested Proofs Allowed.` before introducing them.
+- If you edit another `.v` file that may be a dependency of the current proof file, use `restart=t` in `coqcheck_until` to force a clean recheck path with updated dependencies. Do not use `restart=t` otherwise as that will show you down as the whole file will be checked again.
+- Use `restart=t` iff some other `.v` dependency of the current file changed since the last successful check.
+  Current-file edits do not justify `restart=t`: `coqcheck_until(..., restart=nil)` already does an incremental reload of the current buffer/file before checking.
+  In particular, shell-editing the current file is still a `restart=nil` case.
+- Once you request `restart=t`, let that restart/recheck finish before editing the current proof file again. Do not edit the file mid-restart. In particular, do not edit `dippedlam.v` while a restart-triggered recheck/build is in flight: the checker / `dune` may read the file while constructing the dependency graph, and mid-build edits can desynchronize what is being checked.
+- Before every `coqcheck_until` call, do this decision check explicitly:
+- if no other `.v` dependency changed since the last successful check, use `restart=nil`;
+- if some imported `.v` dependency changed, use `restart=t`.
+  Do not improvise additional reasons for `restart=t`.
+  Note: even when `restart` is `nil`, `coqcheck_until` still falls back to a full restart path when the file is not open in Emacs or its buffer is open but scripting is inactive (`my-coq--coq-active-buffer-p` is false); `reuse` only happens when it is an active, live coq scripting buffer.

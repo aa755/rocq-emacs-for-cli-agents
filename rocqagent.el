@@ -241,6 +241,28 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
               (lambda (&rest _args) t)))
      ,@body))
 
+(defun save-file (filename)
+  "Save existing buffer visiting FILENAME, if that buffer is open."
+  (interactive "fFile: ")
+  (condition-case err
+      (my-coq--without-file-change-prompts
+        (let* ((file (expand-file-name filename))
+               (buf (get-file-buffer file)))
+          (if (not (buffer-live-p buf))
+              (list :ok t :file file :buffer-live nil :saved nil)
+            (with-current-buffer buf
+              (let ((was-modified (buffer-modified-p)))
+                (when was-modified
+                  (let ((inhibit-message t))
+                    (save-buffer)))
+                (list :ok t
+                      :file file
+                      :buffer-live t
+                      :saved was-modified
+                      :modified (buffer-modified-p)))))))
+    (error
+     (list :ok nil :error (error-message-string err)))))
+
 (defun my-coq--coerce-integer (x name)
   "Return X as integer, or signal an error mentioning NAME."
   (cond
