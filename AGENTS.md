@@ -14,7 +14,7 @@ Arguments:
 - `filename`: absolute path to the `.v` file
 - `linenum`: 1-based line number, or `nil` to mean end of file
 - `columnnum`: 0-based column number, or `nil` to mean end of file
-- `restart`: non-`nil` forces restart via `dune coq top`; `nil` reuses the active scripting session when possible
+- `restart`: non-`nil` forces restart and builds dependencies of current file using `dune coq top`; `nil` reuses the active scripting session when possible
 
 Return value:
 - success: `(:ok t :goal STRING :locked-end INT :target INT)`
