@@ -2,6 +2,7 @@
 
 Small Emacs/Proof-General helpers for CLI agents working on Rocq/Coq proofs.
 It can connect to an existing emacs+proof-general+company-coq session and drive proofs efficiently.
+Here is a [demo](https://asciinema.org/a/vxXdoVQI3qzmscpc)
 
 ## Comparison with other approaches
 
