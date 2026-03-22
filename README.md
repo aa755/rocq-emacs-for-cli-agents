@@ -25,7 +25,6 @@ Public entry points:
 - `coqcheck_until(filename, linenum, columnnum, restart)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
-- `rocqagent_status_path()`
 
 See [AGENTS.md](AGENTS.md) for details.
 

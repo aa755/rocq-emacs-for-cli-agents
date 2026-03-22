@@ -6,7 +6,6 @@ This repository exposes a small Emacs/Proof-General API for interactive Rocq/Coq
 - `coqcheck_until(filename, linenum, columnnum, restart)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
-- `rocqagent_status_path()`
 
 ## `coqcheck_until`
 
@@ -74,10 +73,16 @@ Semantics:
 `emacsclient --eval` calls are serialized by the Emacs server, so a second `emacsclient` request is not a reliable interrupt mechanism.
 
 Use the shell-visible status file instead:
-- call `emacsclient --eval '(rocqagent_status_path)'`
+- derive the status path directly from the Emacs server name:
+  `status_dir="${TMPDIR:-/tmp}/rocqagent"`
+  `server="${EMACS_SOCKET_NAME:-default}"`
+  `server_tag=$(printf '%s' "$server" | sed 's/[^[:alnum:]_.-]/_/g')`
+  `status_file="$status_dir/$server_tag.status"`
 - read the plist in that file while the request is running
 - extract `:cancel-file`
 - `touch` that path from the shell
+
+The status path is static for a given Emacs server. The random per-operation path is `:cancel-file`, not the status file.
 
 While busy, the status file contains a plist of the form:
 - `:busy t`
