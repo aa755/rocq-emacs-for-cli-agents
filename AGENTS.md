@@ -118,6 +118,7 @@ emacsclient --eval '(save-file "/abs/path/file.v")'
   Current-file edits do not justify `restart=t`: `coqcheck_until(..., restart=nil)` already does an incremental reload of the current buffer/file before checking.
   In particular, shell-editing the current file is still a `restart=nil` case.
 - Once you request `restart=t`, let that restart/recheck finish before editing the current proof file again. Do not edit the file mid-restart. In particular, do not edit `dippedlam.v` while a restart-triggered recheck/build is in flight: the checker / `dune` may read the file while constructing the dependency graph, and mid-build edits can desynchronize what is being checked.
+- A long-running `restart=t` request is expected: `dune coq top` may rebuild dependencies before it gets back to the target file. Do not cancel a `restart=t` request merely because it is slow. Use the cancel-file only when the request is clearly wedged or has become obsolete.
 - Before every `coqcheck_until` call, do this decision check explicitly:
 - if no other `.v` dependency changed since the last successful check, use `restart=nil`;
 - if some imported `.v` dependency changed, use `restart=t`.
