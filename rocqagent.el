@@ -66,24 +66,47 @@
   (interactive)
   (rocqagent--status-file))
 
+(defun rocqagent--write-file-atomically (path writer)
+  "Write PATH atomically by calling WRITER in a temp buffer and renaming.
+WRITER is called with the temp buffer current."
+  (let* ((dir (file-name-directory path))
+         (name (file-name-nondirectory path))
+         (temp (make-temp-file
+                (expand-file-name (format ".%s.tmp-" name) dir)))
+         (mode (and (file-exists-p path)
+                    (file-modes path))))
+    (unwind-protect
+        (progn
+          (with-temp-file temp
+            (funcall writer))
+          (when mode
+            (set-file-modes temp mode))
+          (rename-file temp path t)
+          path)
+      (when (file-exists-p temp)
+        (ignore-errors
+          (delete-file temp))))))
+
 (defun rocqagent--write-status (busy &optional kind file op-id cancel-file)
   "Write a shell-visible status plist for the current server.
 When BUSY is non-nil, include KIND, FILE, OP-ID, and CANCEL-FILE."
   (let ((path (or rocqagent--active-status-file
                   (rocqagent--status-file))))
-    (with-temp-file path
-      (let ((print-length nil)
-            (print-level nil))
-        (prin1
-         (append
-          (list :busy (and busy t)
-                :server (rocqagent--server-tag)
-                :updated-at (float-time))
-          (when kind (list :kind kind))
-          (when file (list :file file))
-          (when op-id (list :id op-id))
-          (when cancel-file (list :cancel-file cancel-file)))
-         (current-buffer))))
+    (rocqagent--write-file-atomically
+     path
+     (lambda ()
+       (let ((print-length nil)
+             (print-level nil))
+         (prin1
+          (append
+           (list :busy (and busy t)
+                 :server (rocqagent--server-tag)
+                 :updated-at (float-time))
+           (when kind (list :kind kind))
+           (when file (list :file file))
+           (when op-id (list :id op-id))
+           (when cancel-file (list :cancel-file cancel-file)))
+          (current-buffer)))))
     path))
 
 (defun rocqagent--external-cancel-requested-p ()
