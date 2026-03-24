@@ -66,6 +66,11 @@ Semantics:
 - If Emacs already has a live buffer visiting `filename`, save that buffer.
 - If no live buffer exists, do nothing and return success.
 - This is intended as a pre-edit sync helper before shell-side edits.
+- IN ALL CAPS BECAUSE THIS IS EASY TO GET WRONG: ALWAYS CALL `save-file` BEFORE
+  ANY SHELL-SIDE EDIT TO A `.v` FILE THAT MAY BE OPEN IN EMACS.
+- The main purpose of `save-file` is to avoid clobbering newer buffer contents
+  with shell-side edits. This is a required precondition for mixed
+  Emacs+shell workflows.
 
 
 ## Interrupting a long-running request
@@ -107,6 +112,11 @@ emacsclient --eval '(save-file "/abs/path/file.v")'
 
 ## Optimal Usage pattern:
 - Before shell-side edits to a `.v` file, call `save-file` with the absolute path.
+- IN ALL CAPS: NEVER SKIP THE `save-file` CALL BEFORE SHELL-SIDE EDITS TO A
+  `.v` FILE.
+- If you shell-edit a file that is open in Emacs, the next API step should be
+  `coqcheck_until`, which incrementally reloads the current file. Do not rely
+  on a later `save-file` call to repair a stale buffer state.
 - For query output (`Search`/`Locate`/`Print`/...), first call `coqcheck_until` to the desired point, then call `coqquery_at_curpoint`.
 - Dont edit files via emacs/emacsclient, just use this to see goal at point, or to see errors
 - For large Coq files (e.g. >1000 lines), do not use `dune build` during iterative editing/debugging; use the Emacs Coq API (`coqcheck_until` / `coqquery_at_curpoint`) instead. Use `dune` for these files only as an explicit final verification step when requested.
