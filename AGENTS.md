@@ -118,6 +118,7 @@ emacsclient --eval '(save-file "/abs/path/file.v")'
   `coqcheck_until`, which incrementally reloads the current file. Do not rely
   on a later `save-file` call to repair a stale buffer state.
 - For query output (`Search`/`Locate`/`Print`/...), first call `coqcheck_until` to the desired point, then call `coqquery_at_curpoint`.
+- IN ALL CAPS: DO NOT USE `coqquery_at_curpoint "Show." ...` FOR GOAL INSPECTION. `coqcheck_until` ALREADY RETURNS THE GOAL/ERROR STATE AT THE CHECKED POINT. Use `coqquery_at_curpoint` only for non-goal queries such as `Search`, `Locate`, `Print`, `Check`, `Compute`, or `Eval`.
 - Dont edit files via emacs/emacsclient, just use this to see goal at point, or to see errors
 - For large Coq files (e.g. >1000 lines), do not use `dune build` during iterative editing/debugging; use the Emacs Coq API (`coqcheck_until` / `coqquery_at_curpoint`) instead. Use `dune` for these files only as an explicit final verification step when requested.
 - When all edits are done and `coqcheck_until(file, nil, nil, nil)` says no error, do use `dune` for a final check before telling the user that the task is done.
