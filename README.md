@@ -23,10 +23,16 @@ Compared with Emacs MCP servers:
 Public entry points:
 
 - `coqcheck_until(filename, linenum, columnnum, restart)`
+- `coqcheck_until_async(filename, linenum, columnnum, restart)`
+- `coqcheck_status(&optional request_id)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
 
-See [AGENTS.md](AGENTS.md) for details.
+For long-running checks, use `coqcheck_until_async` and poll `coqcheck_status`.
+Status reports include a `:subphase` field, so clients can distinguish
+`restart=t` dependency compilation (`dune-deps`) from actual script checking.
+
+See [AGENTS.md](AGENTS.md) for the full API contract.
 
 ## Setup
 

@@ -50,6 +50,9 @@
 (defvar rocqagent--active-target nil
   "Current target point for the active rocqagent check, or nil.")
 
+(defvar rocqagent--active-subphase nil
+  "Current finer-grained phase for the active operation, or nil.")
+
 (defun rocqagent--control-dir ()
   "Return the directory that stores rocqagent control files."
   (let ((dir (expand-file-name "rocqagent" temporary-file-directory)))
@@ -133,6 +136,8 @@ When RESULT is non-nil, persist it in the status file."
           (when cancel-file (list :cancel-file cancel-file))
           (when rocqagent--active-async (list :async t))
           (when rocqagent--active-target (list :target rocqagent--active-target))
+          (when (and busy rocqagent--active-subphase)
+            (list :subphase rocqagent--active-subphase))
           (when (and (buffer-live-p rocqagent--active-buffer)
                      (with-current-buffer rocqagent--active-buffer
                        (fboundp 'proof-unprocessed-begin)))
@@ -142,6 +147,20 @@ When RESULT is non-nil, persist it in the status file."
           (when result (list :result result)))))
     (setq rocqagent--status-last-touch (float-time))
     (rocqagent--write-status-plist plist)))
+
+(defun rocqagent--set-subphase (subphase &optional force)
+  "Record SUBPHASE for the active operation and refresh status if needed."
+  (when rocqagent--active-kind
+    (when (or force
+              (not (eq rocqagent--active-subphase subphase)))
+      (setq rocqagent--active-subphase subphase)
+      (rocqagent--write-status
+       t
+       rocqagent--active-kind
+       rocqagent--active-file
+       rocqagent--active-id
+       rocqagent--active-cancel-file
+       'running))))
 
 (defun rocqagent--touch-status (&optional phase)
   "Refresh the current status file while an operation is active."
@@ -183,6 +202,7 @@ When RESULT is non-nil, persist it in the status file."
           rocqagent--interrupt-sent nil
           rocqagent--latest-result nil
           rocqagent--active-target nil
+          rocqagent--active-subphase nil
           rocqagent--status-last-touch 0.0)
     (rocqagent--write-status t kind expanded-file op-id cancel-file 'running)
     op-id))
@@ -209,6 +229,7 @@ PHASE defaults to `done'. RESULT, when non-nil, is stored in the status file."
           rocqagent--active-thread nil
           rocqagent--active-process nil
           rocqagent--active-target nil
+          rocqagent--active-subphase nil
           rocqagent--status-last-touch 0.0
           rocqagent--cancel-requested nil
           rocqagent--interrupt-sent nil)))
@@ -261,6 +282,7 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
 
 (defun rocqagent--wait-for-process-with-ui (proc &optional ui-buf)
   "Wait for PROC to finish while keeping Emacs responsive."
+  (rocqagent--set-subphase 'dune-deps t)
   (while (process-live-p proc)
     (rocqagent--maybe-handle-cancel ui-buf proc)
     (rocqagent--touch-status 'running)
@@ -496,6 +518,9 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
   (let ((buf (or script-buf
                  (and (boundp 'proof-script-buffer) proof-script-buffer)
                  (current-buffer))))
+    (rocqagent--set-subphase
+     (if (eq rocqagent--active-kind 'query) 'query 'checking)
+     t)
     (while (and (boundp 'proof-shell-busy) proof-shell-busy)
       (rocqagent--maybe-handle-cancel buf)
       (rocqagent--touch-status 'running)

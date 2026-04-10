@@ -56,6 +56,7 @@ Return value:
 Status fields:
 - `:busy t|nil`
 - `:phase running|done|error|canceled|idle`
+- `:subphase dune-deps|checking|query` while running
 - `:id INT`
 - `:kind check|query`
 - `:file STRING`
@@ -68,6 +69,9 @@ Status fields:
 Semantics:
 - `updated-at` is refreshed during long-running checks
 - `locked-end` is refreshed during long-running checks when a proof-script buffer is active; use it to see whether the check is actually advancing through the file
+- `:subphase dune-deps` means a `restart=t` request is still in the `dune coq top` dependency-build phase before Proof General starts advancing through the target script buffer
+- `:subphase checking` means Proof General / Rocq is advancing through the script
+- `:subphase query` means a Rocq query is currently running
 - if a `request_id` is provided, `coqcheck_status` verifies that the status belongs to that request
 - after completion, the final result is embedded under `:result`
 
@@ -137,6 +141,7 @@ The status path is static for a given Emacs server. The random per-operation pat
 While busy, the status file contains a plist of the form:
 - `:busy t`
 - `:phase running`
+- `:subphase dune-deps|checking|query`
 - `:server STRING`
 - `:updated-at FLOAT`
 - `:kind check|query`
