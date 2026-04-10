@@ -1,4 +1,4 @@
-;;; rocqagent.el --- Minimal Rocq/Proof General agent API
+;;; rocqagent.el --- Minimal Rocq/Proof General agent API -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
 (require 'subr-x)
@@ -26,6 +26,15 @@
 (defvar rocqagent--active-status-file nil
   "Filesystem status path for the current rocqagent server.")
 
+(defvar rocqagent--active-async nil
+  "Non-nil when the current rocqagent operation was started asynchronously.")
+
+(defvar rocqagent--active-thread nil
+  "Thread running the current async rocqagent operation, or nil.")
+
+(defvar rocqagent--status-last-touch 0.0
+  "Last time the status file was refreshed for the current operation.")
+
 (defvar rocqagent--cancel-requested nil
   "Non-nil when the current rocqagent operation should be interrupted.")
 
@@ -34,6 +43,12 @@
 
 (defvar rocqagent--next-operation-id 0
   "Monotone counter used to identify rocqagent operations.")
+
+(defvar rocqagent--latest-result nil
+  "Most recent completed rocqagent result plist for the current server.")
+
+(defvar rocqagent--active-target nil
+  "Current target point for the active rocqagent check, or nil.")
 
 (defun rocqagent--control-dir ()
   "Return the directory that stores rocqagent control files."
@@ -87,35 +102,70 @@ WRITER is called with the temp buffer current."
         (ignore-errors
           (delete-file temp))))))
 
-(defun rocqagent--write-status (busy &optional kind file op-id cancel-file)
-  "Write a shell-visible status plist for the current server.
-When BUSY is non-nil, include KIND, FILE, OP-ID, and CANCEL-FILE."
+(defun rocqagent--write-status-plist (plist)
+  "Write PLIST atomically to the current server's status file."
   (let ((path (or rocqagent--active-status-file
                   (rocqagent--status-file))))
     (rocqagent--write-file-atomically
      path
      (lambda ()
-       (let ((print-length nil)
-             (print-level nil))
-         (prin1
-          (append
-           (list :busy (and busy t)
-                 :server (rocqagent--server-tag)
-                 :updated-at (float-time))
-           (when kind (list :kind kind))
-           (when file (list :file file))
-           (when op-id (list :id op-id))
-           (when cancel-file (list :cancel-file cancel-file)))
-          (current-buffer)))))
+        (let ((print-length nil)
+              (print-level nil))
+          (prin1
+           (append
+            plist
+            (list :server (rocqagent--server-tag)
+                  :updated-at (float-time)))
+           (current-buffer)))))
     path))
+
+(defun rocqagent--write-status (busy &optional kind file op-id cancel-file phase result)
+  "Write a shell-visible status plist for the current server.
+When BUSY is non-nil, include KIND, FILE, OP-ID, CANCEL-FILE, and PHASE.
+When RESULT is non-nil, persist it in the status file."
+  (let ((plist
+         (append
+          (list :busy (and busy t))
+          (when phase (list :phase phase))
+          (when kind (list :kind kind))
+          (when file (list :file file))
+          (when op-id (list :id op-id))
+          (when cancel-file (list :cancel-file cancel-file))
+          (when rocqagent--active-async (list :async t))
+          (when rocqagent--active-target (list :target rocqagent--active-target))
+          (when (and (buffer-live-p rocqagent--active-buffer)
+                     (with-current-buffer rocqagent--active-buffer
+                       (fboundp 'proof-unprocessed-begin)))
+            (list :locked-end
+                  (with-current-buffer rocqagent--active-buffer
+                    (proof-unprocessed-begin))))
+          (when result (list :result result)))))
+    (setq rocqagent--status-last-touch (float-time))
+    (rocqagent--write-status-plist plist)))
+
+(defun rocqagent--touch-status (&optional phase)
+  "Refresh the current status file while an operation is active."
+  (when rocqagent--active-kind
+    (let ((now (float-time)))
+      (when (> (- now rocqagent--status-last-touch) 0.25)
+        (rocqagent--write-status
+         t
+         rocqagent--active-kind
+         rocqagent--active-file
+         rocqagent--active-id
+         rocqagent--active-cancel-file
+         (or phase 'running))))))
 
 (defun rocqagent--external-cancel-requested-p ()
   "Return non-nil when the current operation's cancel token has been touched."
   (and (stringp rocqagent--active-cancel-file)
        (file-exists-p rocqagent--active-cancel-file)))
 
-(defun rocqagent--begin-operation (kind file buf)
+(defun rocqagent--begin-operation (kind file buf &optional async)
   "Record a running rocqagent operation of KIND for FILE in BUF."
+  (when rocqagent--active-kind
+    (error "Another rocqagent operation is already active (id=%s kind=%s)"
+           rocqagent--active-id rocqagent--active-kind))
   (let* ((expanded-file (expand-file-name file))
          (op-id (cl-incf rocqagent--next-operation-id))
          (cancel-file (rocqagent--fresh-cancel-file))
@@ -126,13 +176,20 @@ When BUSY is non-nil, include KIND, FILE, OP-ID, and CANCEL-FILE."
           rocqagent--active-cancel-file cancel-file
           rocqagent--active-status-file status-file
           rocqagent--active-buffer buf
+          rocqagent--active-async (and async t)
+          rocqagent--active-thread nil
           rocqagent--active-process nil
           rocqagent--cancel-requested nil
-          rocqagent--interrupt-sent nil)
-    (rocqagent--write-status t kind expanded-file op-id cancel-file)))
+          rocqagent--interrupt-sent nil
+          rocqagent--latest-result nil
+          rocqagent--active-target nil
+          rocqagent--status-last-touch 0.0)
+    (rocqagent--write-status t kind expanded-file op-id cancel-file 'running)
+    op-id))
 
-(defun rocqagent--finish-operation ()
-  "Clear the currently tracked rocqagent operation."
+(defun rocqagent--finish-operation (&optional phase result)
+  "Clear the currently tracked rocqagent operation.
+PHASE defaults to `done'. RESULT, when non-nil, is stored in the status file."
   (let ((kind rocqagent--active-kind)
         (file rocqagent--active-file)
         (op-id rocqagent--active-id)
@@ -140,14 +197,19 @@ When BUSY is non-nil, include KIND, FILE, OP-ID, and CANCEL-FILE."
     (when (stringp cancel-file)
       (ignore-errors
         (delete-file cancel-file)))
-    (rocqagent--write-status nil kind file op-id)
+    (setq rocqagent--latest-result result)
+    (rocqagent--write-status nil kind file op-id nil (or phase 'done) result)
     (setq rocqagent--active-kind nil
           rocqagent--active-file nil
           rocqagent--active-id nil
           rocqagent--active-cancel-file nil
           rocqagent--active-status-file nil
           rocqagent--active-buffer nil
+          rocqagent--active-async nil
+          rocqagent--active-thread nil
           rocqagent--active-process nil
+          rocqagent--active-target nil
+          rocqagent--status-last-touch 0.0
           rocqagent--cancel-requested nil
           rocqagent--interrupt-sent nil)))
 
@@ -201,7 +263,9 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
   "Wait for PROC to finish while keeping Emacs responsive."
   (while (process-live-p proc)
     (rocqagent--maybe-handle-cancel ui-buf proc)
+    (rocqagent--touch-status 'running)
     (accept-process-output nil 0.05)
+    (thread-yield)
     (redisplay t))
   (rocqagent--maybe-handle-cancel ui-buf proc)
   (process-exit-status proc))
@@ -434,6 +498,7 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
                  (current-buffer))))
     (while (and (boundp 'proof-shell-busy) proof-shell-busy)
       (rocqagent--maybe-handle-cancel buf)
+      (rocqagent--touch-status 'running)
       (when (buffer-live-p buf)
         (with-current-buffer buf
           (let* ((proc-point (if (fboundp 'proof-unprocessed-begin)
@@ -446,6 +511,7 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
                  win
                  (min (max proc-point (point-min)) (point-max))))))))
       (accept-process-output nil 0.05)
+      (thread-yield)
       (redisplay t)))
   (rocqagent--maybe-handle-cancel
    (or script-buf
@@ -511,6 +577,81 @@ When FORCED-ERROR is non-nil, always return an error plist."
   (my-coq--wait-for-proof-shell-with-ui (current-buffer))
   proof-shell-last-output)
 
+(defun rocqagent--classify-final-phase (result)
+  "Return status phase keyword for RESULT plist."
+  (cond
+   ((plist-get result :interrupted) 'canceled)
+   ((plist-get result :ok) 'done)
+   (t 'error)))
+
+(defun rocqagent--coqcheck-until-body (filename linenum columnnum restart)
+  "Internal implementation shared by sync and async Coq checks."
+  (let* ((file (expand-file-name filename))
+         (existing (get-file-buffer file))
+         (buf (or existing (find-file-noselect file)))
+         (target-point nil))
+    (condition-case err
+        (my-coq--without-file-change-prompts
+          (let ((reuse (and (not restart)
+                            existing
+                            (my-coq--coq-active-buffer-p existing))))
+            (unless (file-readable-p file)
+              (error "File is not readable: %s" file))
+            (with-current-buffer buf
+              (unless (eq major-mode 'coq-mode)
+                (coq-mode))
+              ;; Avoid interactive PG prompts in non-interactive API calls.
+              (let ((proof-query-file-save-when-activating-scripting nil)
+                    (proof-auto-action-when-deactivating-scripting 'retract)
+                    (restart-result nil))
+                (rocqagent--maybe-handle-cancel buf)
+                (when (and (boundp 'proof-shell-busy) proof-shell-busy
+                           (fboundp 'proof-shell-wait))
+                  (my-coq--wait-for-proof-shell-with-ui buf))
+                ;; Sync script buffer text to disk first in both paths.
+                (coq-partial-revert-buffer)
+                (setq target-point
+                      (my-coq--target-point-from-line-column
+                       linenum columnnum))
+                (setq rocqagent--active-target target-point)
+                (if reuse
+                    (unless (= target-point (proof-unprocessed-begin))
+                      (my-coq--goto-safe-processing-point target-point)
+                      (proof-goto-point)
+                      (my-coq--wait-for-proof-shell-with-ui buf))
+                  (progn
+                    (unless (find-root file)
+                      (error "Could not find dune-workspace above %s" file))
+                    (my-coq--goto-safe-processing-point target-point)
+                    (setq restart-result
+                          (reload-to-current-point_aux file buf nil))
+                    (when (and (plist-get restart-result :ok)
+                               (boundp 'proof-shell-busy) proof-shell-busy
+                               (fboundp 'proof-shell-wait))
+                      (my-coq--wait-for-proof-shell-with-ui buf))))
+                (if (and restart-result
+                         (not (plist-get restart-result :ok)))
+                    (append
+                     restart-result
+                     (list :locked-end (if (fboundp 'proof-unprocessed-begin)
+                                           (proof-unprocessed-begin)
+                                         (point-min))
+                           :target target-point))
+                  (my-coq--result-at-target
+                   target-point
+                   (and (not reuse)
+                        (not (my-coq--coq-active-buffer-p buf)))))))))
+      (rocqagent-interrupted
+       (my-coq--interrupted-result
+        (and (buffer-live-p buf)
+             (with-current-buffer buf
+               (if (fboundp 'proof-unprocessed-begin)
+                   (proof-unprocessed-begin)
+                 (point-min))))
+        target-point))
+      (error
+       (list :ok nil :error (error-message-string err))))))
+
 (defun coqcheck_until (filename linenum columnnum restart)
   "Synchronously process Rocq script up to target and return goal/error plist.
 
@@ -528,72 +669,83 @@ If processing fails at or before the requested point, this returns
 an error plist instead of a goal plist."
   (interactive "fFile: \nnLine (1-based): \nnColumn (0-based): \nP")
   (let* ((file (expand-file-name filename))
-         (existing (get-file-buffer file))
-         (buf (or existing (find-file-noselect file)))
-         (target-point nil))
-    (rocqagent--begin-operation 'check file buf)
+         (buf (or (get-file-buffer file) (find-file-noselect file)))
+         (result nil))
+    (rocqagent--begin-operation 'check file buf nil)
     (unwind-protect
-        (condition-case err
-            (my-coq--without-file-change-prompts
-              (let ((reuse (and (not restart)
-                                existing
-                                (my-coq--coq-active-buffer-p existing))))
-                (unless (file-readable-p file)
-                  (error "File is not readable: %s" file))
-                (with-current-buffer buf
-                  (unless (eq major-mode 'coq-mode)
-                    (coq-mode))
-                  ;; Avoid interactive PG prompts in non-interactive API calls.
-                  (let ((proof-query-file-save-when-activating-scripting nil)
-                        (proof-auto-action-when-deactivating-scripting 'retract)
-                        (restart-result nil))
-                    (rocqagent--maybe-handle-cancel buf)
-                    (when (and (boundp 'proof-shell-busy) proof-shell-busy
-                               (fboundp 'proof-shell-wait))
-                      (my-coq--wait-for-proof-shell-with-ui buf))
-                    ;; Sync script buffer text to disk first in both paths.
-                    (coq-partial-revert-buffer)
-                    (setq target-point
-                          (my-coq--target-point-from-line-column
-                           linenum columnnum))
-                    (if reuse
-                        (unless (= target-point (proof-unprocessed-begin))
-                          (my-coq--goto-safe-processing-point target-point)
-                          (proof-goto-point)
-                          (my-coq--wait-for-proof-shell-with-ui buf))
-                      (progn
-                        (unless (find-root file)
-                          (error "Could not find dune-workspace above %s" file))
-                        (my-coq--goto-safe-processing-point target-point)
-                        (setq restart-result
-                              (reload-to-current-point_aux file buf nil))
-                        (when (and (plist-get restart-result :ok)
-                                   (boundp 'proof-shell-busy) proof-shell-busy
-                                   (fboundp 'proof-shell-wait))
-                          (my-coq--wait-for-proof-shell-with-ui buf))))
-                    (if (and restart-result
-                             (not (plist-get restart-result :ok)))
-                        (append
-                         restart-result
-                         (list :locked-end (if (fboundp 'proof-unprocessed-begin)
-                                               (proof-unprocessed-begin)
-                                             (point-min))
-                               :target target-point))
-                      (my-coq--result-at-target
-                       target-point
-                       (and (not reuse)
-                            (not (my-coq--coq-active-buffer-p buf)))))))))
-          (rocqagent-interrupted
-           (my-coq--interrupted-result
-            (and (buffer-live-p buf)
-                 (with-current-buffer buf
-                   (if (fboundp 'proof-unprocessed-begin)
-                       (proof-unprocessed-begin)
-                     (point-min))))
-            target-point))
-          (error
-           (list :ok nil :error (error-message-string err))))
-      (rocqagent--finish-operation))))
+        (progn
+          (setq result
+                (rocqagent--coqcheck-until-body
+                 filename linenum columnnum restart))
+          result)
+      (rocqagent--finish-operation
+       (and result (rocqagent--classify-final-phase result))
+       result))))
+
+(defun coqcheck_until_async (filename linenum columnnum restart)
+  "Start an asynchronous `coqcheck_until' request and return immediately.
+
+Return shape:
+- success: (:ok t :async t :id INT :status-file FILE :cancel-file FILE :phase running)
+- failure: (:ok nil :error STRING)"
+  (interactive "fFile: \nnLine (1-based): \nnColumn (0-based): \nP")
+  (condition-case err
+      (let* ((file (expand-file-name filename))
+             (buf (or (get-file-buffer file) (find-file-noselect file)))
+             (op-id (rocqagent--begin-operation 'check file buf t))
+             (status-file rocqagent--active-status-file)
+             (cancel-file rocqagent--active-cancel-file))
+        (setq rocqagent--active-thread
+              (make-thread
+               (lambda ()
+                 (let ((result nil))
+                   (unwind-protect
+                       (setq result
+                             (rocqagent--coqcheck-until-body
+                              filename linenum columnnum restart))
+                     (rocqagent--finish-operation
+                      (and result (rocqagent--classify-final-phase result))
+                      result))))
+               (format "rocqagent-check-%s" op-id)))
+        (list :ok t
+              :async t
+              :id op-id
+              :status-file status-file
+              :cancel-file cancel-file
+              :phase 'running))
+    (error
+     (list :ok nil :error (error-message-string err)))))
+
+(defun coqcheck_status (&optional request-id)
+  "Return the shell-visible status plist for the current Emacs server.
+
+When REQUEST-ID is non-nil, ensure the returned status corresponds to that id."
+  (interactive)
+  (condition-case err
+      (let* ((path (rocqagent--status-file))
+             (status
+              (if (file-exists-p path)
+                  (with-temp-buffer
+                    (insert-file-contents path)
+                    (read (current-buffer)))
+                (list :busy nil
+                      :phase 'idle
+                      :server (rocqagent--server-tag)
+                      :updated-at (float-time)))))
+        (when (and request-id
+                   (plist-member status :id)
+                   (not (equal (plist-get status :id) request-id)))
+          (setq status
+                (append
+                 (list :ok nil
+                       :error (format "Status is for request %S, not %S"
+                                      (plist-get status :id) request-id))
+                 (list :status status))))
+        (if (plist-member status :ok)
+            status
+          (append (list :ok t) status)))
+    (error
+     (list :ok nil :error (error-message-string err)))))
 
 (defun coqquery_at_curpoint (query filename)
   "Run QUERY at current checked state for FILENAME without changing unwind state.
