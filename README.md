@@ -27,10 +27,28 @@ Public entry points:
 - `coqcheck_status(&optional request_id)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
+- `./rocqagent-health [SERVER]`
 
 For long-running checks, use `coqcheck_until_async` and poll `coqcheck_status`.
 Status reports include a `:subphase` field, so clients can distinguish
 `restart=t` dependency compilation (`dune-deps`) from actual script checking.
+Status files now also record `:server-name`, `:emacs-pid`, `:socket-dir`, and `:socket-path`
+so shell-side tools can distinguish a live daemon from a stale status file.
+
+When you need to know whether a server is actually reachable, do not trust the
+status file by itself. Run `./rocqagent-health SERVER` instead. It combines:
+
+- the persisted status file
+- the recorded Emacs PID
+- the expected socket path
+- a short `emacsclient` ping
+
+This is the intended way to tell apart:
+
+- live and responsive
+- stale/dead PID
+- stale/dead socket
+- RPC path wedged even though the status file says `:busy nil`
 
 See [AGENTS.md](AGENTS.md) for the full API contract.
 

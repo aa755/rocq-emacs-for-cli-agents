@@ -66,11 +66,37 @@
    (or (and (boundp 'server-name) server-name)
        "default")))
 
+(defun rocqagent--server-socket-name ()
+  "Return the actual Emacs server socket name."
+  (or (and (boundp 'server-name) server-name)
+      "server"))
+
 (defun rocqagent--status-file ()
   "Return the status file path for the current Emacs server."
   (expand-file-name
    (format "%s.status" (rocqagent--server-tag))
    (rocqagent--control-dir)))
+
+(defun rocqagent--socket-dir ()
+  "Return the directory where the current Emacs server socket lives, if known."
+  (cond
+   ((and (boundp 'server-socket-dir)
+         (stringp server-socket-dir)
+         (not (string-empty-p server-socket-dir)))
+    (expand-file-name server-socket-dir))
+   ((and (boundp 'server-auth-dir)
+         (stringp server-auth-dir)
+         (not (string-empty-p server-auth-dir)))
+    (expand-file-name server-auth-dir))
+   (t nil)))
+
+(defun rocqagent--socket-path ()
+  "Return the expected socket path for the current Emacs server, if known."
+  (let ((dir (rocqagent--socket-dir)))
+    (when dir
+      (expand-file-name
+       (rocqagent--server-socket-name)
+       dir))))
 
 (defun rocqagent--fresh-cancel-file ()
   "Return a fresh random cancel token path for one rocqagent operation."
@@ -108,7 +134,9 @@ WRITER is called with the temp buffer current."
 (defun rocqagent--write-status-plist (plist)
   "Write PLIST atomically to the current server's status file."
   (let ((path (or rocqagent--active-status-file
-                  (rocqagent--status-file))))
+                  (rocqagent--status-file)))
+        (socket-dir (rocqagent--socket-dir))
+        (socket-path (rocqagent--socket-path)))
     (rocqagent--write-file-atomically
      path
      (lambda ()
@@ -118,6 +146,10 @@ WRITER is called with the temp buffer current."
            (append
             plist
             (list :server (rocqagent--server-tag)
+                  :server-name (rocqagent--server-socket-name)
+                  :emacs-pid (emacs-pid)
+                  :socket-dir socket-dir
+                  :socket-path socket-path
                   :updated-at (float-time)))
            (current-buffer)))))
     path))
