@@ -201,6 +201,9 @@ emacsclient --eval '(save-file "/abs/path/file.v")'
 - For query output (`Search`/`Locate`/`Print`/...), first call `coqcheck_until` to the desired point, then call `coqquery_at_curpoint`.
 - For long-running checks, prefer `coqcheck_until_async` + `coqcheck_status` over a blocking `coqcheck_until`.
 - Use blocking `coqcheck_until` only when you actually want to wait for the answer immediately.
+- Sync vs async: when to use.
+- `sync`: cheap local incremental checks, typically `restart=nil`, near the current checked region.
+- `async`: any `restart=t`, any large-file check to EOF, or any check you suspect may hang on a tactic.
 - IN ALL CAPS: DO NOT USE `coqquery_at_curpoint "Show." ...` FOR GOAL INSPECTION. `coqcheck_until` ALREADY RETURNS THE GOAL/ERROR STATE AT THE CHECKED POINT. Use `coqquery_at_curpoint` only for non-goal queries such as `Search`, `Locate`, `Print`, `Check`, `Compute`, or `Eval`.
 - Dont edit files via emacs/emacsclient, just use this to see goal at point, or to see errors
 - For large Coq files (e.g. >1000 lines), do not use `dune build` during iterative editing/debugging; use the Emacs Coq API (`coqcheck_until` / `coqquery_at_curpoint`) instead. Use `dune` for these files only as an explicit final verification step when requested.
