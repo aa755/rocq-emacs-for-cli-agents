@@ -26,12 +26,6 @@
 (defvar rocqagent--active-status-file nil
   "Filesystem status path for the current rocqagent server.")
 
-(defvar rocqagent--active-async nil
-  "Non-nil when the current rocqagent operation was started asynchronously.")
-
-(defvar rocqagent--active-thread nil
-  "Thread running the current async rocqagent operation, or nil.")
-
 (defvar rocqagent--status-last-touch 0.0
   "Last time the status file was refreshed for the current operation.")
 
@@ -166,7 +160,6 @@ When RESULT is non-nil, persist it in the status file."
           (when file (list :file file))
           (when op-id (list :id op-id))
           (when cancel-file (list :cancel-file cancel-file))
-          (when rocqagent--active-async (list :async t))
           (when rocqagent--active-target (list :target rocqagent--active-target))
           (when (and busy rocqagent--active-subphase)
             (list :subphase rocqagent--active-subphase))
@@ -212,7 +205,7 @@ When RESULT is non-nil, persist it in the status file."
   (and (stringp rocqagent--active-cancel-file)
        (file-exists-p rocqagent--active-cancel-file)))
 
-(defun rocqagent--begin-operation (kind file buf &optional async)
+(defun rocqagent--begin-operation (kind file buf)
   "Record a running rocqagent operation of KIND for FILE in BUF."
   (when rocqagent--active-kind
     (error "Another rocqagent operation is already active (id=%s kind=%s)"
@@ -227,8 +220,6 @@ When RESULT is non-nil, persist it in the status file."
           rocqagent--active-cancel-file cancel-file
           rocqagent--active-status-file status-file
           rocqagent--active-buffer buf
-          rocqagent--active-async (and async t)
-          rocqagent--active-thread nil
           rocqagent--active-process nil
           rocqagent--cancel-requested nil
           rocqagent--interrupt-sent nil
@@ -263,8 +254,6 @@ PHASE defaults to `done'. RESULT, when non-nil, is stored in the status file."
           rocqagent--active-cancel-file nil
           rocqagent--active-status-file nil
           rocqagent--active-buffer nil
-          rocqagent--active-async nil
-          rocqagent--active-thread nil
           rocqagent--active-process nil
           rocqagent--active-target nil
           rocqagent--active-subphase nil
@@ -767,7 +756,7 @@ an error plist instead of a goal plist."
   (let* ((file (expand-file-name filename))
          (buf (or (get-file-buffer file) (find-file-noselect file)))
          (result nil))
-    (rocqagent--begin-operation 'check file buf nil)
+    (rocqagent--begin-operation 'check file buf)
     (unwind-protect
         (progn
           (setq result
@@ -777,40 +766,6 @@ an error plist instead of a goal plist."
       (rocqagent--finish-operation
        (and result (rocqagent--classify-final-phase result))
        result))))
-
-(defun coqcheck_until_async (filename linenum columnnum restart)
-  "Start an asynchronous `coqcheck_until' request and return immediately.
-
-Return shape:
-- success: (:ok t :async t :id INT :status-file FILE :cancel-file FILE :phase running)
-- failure: (:ok nil :error STRING)"
-  (interactive "fFile: \nnLine (1-based): \nnColumn (0-based): \nP")
-  (condition-case err
-      (let* ((file (expand-file-name filename))
-             (buf (or (get-file-buffer file) (find-file-noselect file)))
-             (op-id (rocqagent--begin-operation 'check file buf t))
-             (status-file rocqagent--active-status-file)
-             (cancel-file rocqagent--active-cancel-file))
-        (setq rocqagent--active-thread
-              (make-thread
-               (lambda ()
-                 (let ((result nil))
-                   (unwind-protect
-                       (setq result
-                             (rocqagent--coqcheck-until-body
-                              filename linenum columnnum restart))
-                     (rocqagent--finish-operation
-                      (and result (rocqagent--classify-final-phase result))
-                      result))))
-               (format "rocqagent-check-%s" op-id)))
-        (list :ok t
-              :async t
-              :id op-id
-              :status-file status-file
-              :cancel-file cancel-file
-              :phase 'running))
-    (error
-     (list :ok nil :error (error-message-string err)))))
 
 (defun coqcheck_status (&optional request-id)
   "Return the shell-visible status plist for the current Emacs server.

@@ -23,15 +23,15 @@ Compared with Emacs MCP servers:
 Public entry points:
 
 - `coqcheck_until(filename, linenum, columnnum, restart)`
-- `coqcheck_until_async(filename, linenum, columnnum, restart)`
 - `coqcheck_status(&optional request_id)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
 - `./rocqagent-health [SERVER]`
 
-For long-running checks, use `coqcheck_until_async` and poll `coqcheck_status`.
-Status reports include a `:subphase` field, so clients can distinguish
-`restart=t` dependency compilation (`dune-deps`) from actual script checking.
+For long-running checks, run `coqcheck_until` in the background from the shell
+and poll `coqcheck_status`. Status reports include a `:subphase` field, so
+clients can distinguish `restart=t` dependency compilation (`dune-deps`) from
+actual script checking.
 Status files now also record `:server-name`, `:emacs-pid`, `:socket-dir`, and `:socket-path`
 so shell-side tools can distinguish a live daemon from a stale status file.
 

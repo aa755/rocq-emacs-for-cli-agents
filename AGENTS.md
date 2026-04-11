@@ -4,7 +4,6 @@ This repository exposes a small Emacs/Proof-General API for interactive Rocq/Coq
 ## Entry points
 
 - `coqcheck_until(filename, linenum, columnnum, restart)`
-- `coqcheck_until_async(filename, linenum, columnnum, restart)`
 - `coqcheck_status(&optional request_id)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
@@ -29,26 +28,10 @@ Semantics:
 - With `restart=t`, the file must live under a Dune workspace.
 - At end of file there is usually no open proof, so `:goal` may contain the `Show.` error text rather than a useful goal state.
 
-## `coqcheck_until_async`
-
-Arguments:
-- same as `coqcheck_until`
-
-Return value:
-- success: `(:ok t :async t :id INT :status-file FILE :cancel-file FILE :phase running)`
-- failure: `(:ok nil :error STRING)`
-
-Semantics:
-- starts one background check on the current Emacs server and returns immediately
-- there is at most one active rocqagent operation per Emacs server
-- poll with `coqcheck_status`
-- cancel from the shell by `touch`ing the returned `:cancel-file`
-- use this for long-running checks; it avoids blocking the shell on `emacsclient --eval`
-
 ## `coqcheck_status`
 
 Arguments:
-- `request_id`: optional request id returned by `coqcheck_until_async`
+- `request_id`: optional operation id, typically read from the live status file when the caller backgrounded `coqcheck_until`
 
 Return value:
 - success: `(:ok t ...status fields...)`
@@ -166,7 +149,7 @@ After completion, `:busy nil` and `:phase` becomes one of:
 - `error`
 - `canceled`
 
-For async checks, the final API result is stored under `:result`.
+For backgrounded `coqcheck_until` calls, the final API result is stored under `:result`.
 
 The running request polls for the cancel token and returns:
 - `(:ok nil :error "Interrupted" :interrupted t ...)`
@@ -201,11 +184,19 @@ Practical rule:
 ```sh
 emacsclient --eval '(coqcheck_until "/abs/path/file.v" 120 4 nil)'
 emacsclient --eval '(coqcheck_until "/abs/path/file.v" nil nil t)'
-emacsclient --eval '(coqcheck_until_async "/abs/path/file.v" 120 4 nil)'
-emacsclient --eval '(coqcheck_status 7)'
+emacsclient --eval '(rocqagent_status_path())'
+emacsclient --eval '(coqcheck_status)'
 emacsclient --eval '(coqquery_at_curpoint "Check nat." "/abs/path/file.v")'
 emacsclient --eval '(save-file "/abs/path/file.v")'
 ./rocqagent-health codex-checkmin-inline
+```
+
+Background long-running check from the shell:
+
+```sh
+emacsclient --eval '(coqcheck_until "/abs/path/file.v" nil nil t)' >/tmp/check.out 2>/tmp/check.err &
+status_file=$(emacsclient --eval '(rocqagent_status_path())' | tr -d '"')
+cat "$status_file"
 ```
 
 ## Optimal Usage pattern:
@@ -216,11 +207,11 @@ emacsclient --eval '(save-file "/abs/path/file.v")'
   `coqcheck_until`, which incrementally reloads the current file. Do not rely
   on a later `save-file` call to repair a stale buffer state.
 - For query output (`Search`/`Locate`/`Print`/...), first call `coqcheck_until` to the desired point, then call `coqquery_at_curpoint`.
-- For long-running checks, prefer `coqcheck_until_async` + `coqcheck_status` over a blocking `coqcheck_until`.
-- Use blocking `coqcheck_until` only when you actually want to wait for the answer immediately.
-- Sync vs async: when to use.
-- `sync`: cheap local incremental checks, typically `restart=nil`, near the current checked region.
-- `async`: any `restart=t`, any large-file check to EOF, or any check you suspect may hang on a tactic.
+- For long-running checks, background `coqcheck_until` in the shell and poll `coqcheck_status`.
+- Use foreground `coqcheck_until` only when you actually want to wait for the answer immediately.
+- Foreground vs background: when to use.
+- `foreground`: cheap local incremental checks, typically `restart=nil`, near the current checked region.
+- `background`: any `restart=t`, any large-file check to EOF, or any check you suspect may hang on a tactic.
 - IN ALL CAPS: DO NOT USE `coqquery_at_curpoint "Show." ...` FOR GOAL INSPECTION. `coqcheck_until` ALREADY RETURNS THE GOAL/ERROR STATE AT THE CHECKED POINT. Use `coqquery_at_curpoint` only for non-goal queries such as `Search`, `Locate`, `Print`, `Check`, `Compute`, or `Eval`.
 - Dont edit files via emacs/emacsclient, just use this to see goal at point, or to see errors
 - For large Coq files (e.g. >1000 lines), do not use `dune build` during iterative editing/debugging; use the Emacs Coq API (`coqcheck_until` / `coqquery_at_curpoint`) instead. Use `dune` for these files only as an explicit final verification step when requested.
