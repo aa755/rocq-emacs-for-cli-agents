@@ -159,6 +159,27 @@ For async checks, the final API result is stored under `:result`.
 The running request polls for the cancel token and returns:
 - `(:ok nil :error "Interrupted" :interrupted t ...)`
 
+## When the Emacs Server Appears Wedged
+
+- IN ALL CAPS: DO NOT JUST ABANDON THE EMACS SERVER OR KILL THE EMACS SERVER.
+- A wedged `emacsclient` request may still correspond to a live Rocq / Proof General operation inside Emacs.
+- Killing only the Emacs server can leave the underlying Coq / proof-shell process orphaned and still consuming memory/CPU.
+
+Use this recovery sequence instead:
+
+1. Inspect the server status file first.
+   - Derive it from the server name as described above, or use `rocqagent_status_path()`.
+2. If the status says `:busy t`, extract `:cancel-file` and `touch` it from the shell.
+3. Wait for the status file to change to `:phase canceled`, `done`, or `error`.
+4. Only after the active request has been canceled/finished should you consider restarting the Emacs server.
+5. If you truly must restart the server, first check for surviving Rocq / Proof General / `coqtop` subprocesses associated with that server and clean them up deliberately. Do not assume killing Emacs cleaned them up.
+
+Practical rule:
+
+- If a blocking `coqcheck_until` call seems hung, do not start another random Emacs daemon.
+- Do not rely on another `emacsclient --eval` call to interrupt it.
+- Read the status file, `touch` the cancel file, and wait for the operation to stop.
+
 ## Examples
 
 ```sh
