@@ -245,10 +245,16 @@ PHASE defaults to `done'. RESULT, when non-nil, is stored in the status file."
   (let ((kind rocqagent--active-kind)
         (file rocqagent--active-file)
         (op-id rocqagent--active-id)
-        (cancel-file rocqagent--active-cancel-file))
+        (cancel-file rocqagent--active-cancel-file)
+        (proof-proc (rocqagent--proof-shell-process rocqagent--active-buffer))
+        (active-proc rocqagent--active-process))
     (when (stringp cancel-file)
       (ignore-errors
         (delete-file cancel-file)))
+    (ignore-errors
+      (rocqagent--unlock-process-thread proof-proc))
+    (ignore-errors
+      (rocqagent--unlock-process-thread active-proc))
     (setq rocqagent--latest-result result)
     (rocqagent--write-status nil kind file op-id nil (or phase 'done) result)
     (setq rocqagent--active-kind nil
@@ -272,6 +278,38 @@ PHASE defaults to `done'. RESULT, when non-nil, is stored in the status file."
       (and (buffer-live-p buf)
            (with-current-buffer buf
              (and (boundp 'proof-shell-busy) proof-shell-busy)))))
+
+(defun rocqagent--proof-shell-process (&optional buf)
+  "Return the live Proof General process for BUF, or nil."
+  (let ((script-buf (or buf
+                        rocqagent--active-buffer
+                        (and (boundp 'proof-script-buffer) proof-script-buffer))))
+    (when (buffer-live-p script-buf)
+      (with-current-buffer script-buf
+        (let ((shell-buf (and (boundp 'proof-shell-buffer) proof-shell-buffer)))
+          (and (buffer-live-p shell-buf)
+               (get-buffer-process shell-buf)))))))
+
+(defun rocqagent--claim-process-thread (&optional proc)
+  "Move PROC's Emacs thread lock to the current thread when needed."
+  (let ((p (or proc (rocqagent--proof-shell-process))))
+    (when (and (processp p)
+               (process-live-p p)
+               (fboundp 'process-thread)
+               (fboundp 'set-process-thread))
+      (let ((owner (process-thread p))
+            (me (current-thread)))
+        (unless (eq owner me)
+          (set-process-thread p me))))
+    p))
+
+(defun rocqagent--unlock-process-thread (&optional proc)
+  "Release PROC's Emacs thread lock."
+  (let ((p (or proc (rocqagent--proof-shell-process))))
+    (when (and (processp p)
+               (process-live-p p)
+               (fboundp 'set-process-thread))
+      (set-process-thread p nil))))
 
 (defun rocqagent--signal-interrupt (&optional hard)
   "Interrupt the active rocqagent operation.
@@ -661,6 +699,7 @@ When FORCED-ERROR is non-nil, always return an error plist."
               (let ((proof-query-file-save-when-activating-scripting nil)
                     (proof-auto-action-when-deactivating-scripting 'retract)
                     (restart-result nil))
+                (rocqagent--claim-process-thread)
                 (rocqagent--maybe-handle-cancel buf)
                 (when (and (boundp 'proof-shell-busy) proof-shell-busy
                            (fboundp 'proof-shell-wait))
@@ -839,6 +878,7 @@ Return shape:
                            (raw "")
                            (query-output "")
                            (locked-after nil))
+                      (rocqagent--claim-process-thread)
                       (rocqagent--maybe-handle-cancel buf)
                       (setq locked-before
                             (if (fboundp 'proof-unprocessed-begin)
