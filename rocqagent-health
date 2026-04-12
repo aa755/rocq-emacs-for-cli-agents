@@ -187,6 +187,8 @@ def classify_health(
     if not status_exists:
         if rpc_state == "ok":
             return "live_no_status"
+        if rpc_state == "skipped":
+            return "no_status_no_ping"
         if socket_is_live is False or (rpc_state == "error" and rpc_dead_socket(rpc_stderr)):
             return "no_status_dead_socket"
         return "no_status"
@@ -194,6 +196,8 @@ def classify_health(
         return "stale_dead_pid_busy" if busy else "stale_dead_pid_idle"
     if socket_is_live is False or (rpc_state == "error" and rpc_dead_socket(rpc_stderr)):
         return "stale_dead_socket_busy" if busy else "stale_dead_socket_idle"
+    if rpc_state == "skipped":
+        return "busy_no_ping" if busy else "idle_no_ping"
     if rpc_state == "ok":
         return "busy_live" if busy else "idle_live"
     if rpc_state == "timeout":
@@ -202,7 +206,13 @@ def classify_health(
 
 
 def exit_code_for(health: str) -> int:
-    if health in {"busy_live", "idle_live", "live_no_status"}:
+    if health in {
+        "busy_live",
+        "idle_live",
+        "live_no_status",
+        "busy_no_ping",
+        "idle_no_ping",
+    }:
         return 0
     return 1
 

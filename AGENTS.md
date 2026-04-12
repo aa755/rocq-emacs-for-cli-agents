@@ -4,9 +4,10 @@ This repository exposes a small Emacs/Proof-General API for interactive Rocq/Coq
 ## Entry points
 
 - `coqcheck_until(filename, linenum, columnnum, restart)`
-- `coqcheck_status(&optional request_id)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
+- `coqcheck_status(&optional request_id)` when the server is idle and you are already inside an Emacs RPC
+- `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
 
 ## `coqcheck_until`
@@ -65,6 +66,9 @@ Semantics:
 - `:server` is the filesystem-safe status tag; `:server-name` is the actual socket name used by `emacsclient`
 - `coqcheck_status` reports what the server last wrote to disk; it does not by itself prove that `emacsclient` RPCs are still responsive
 - use `./rocqagent-health SERVER` when you need an external liveness check
+- IN ALL CAPS: DO NOT USE `coqcheck_status` AS THE SHELL-SIDE POLLING API FOR A RUNNING REQUEST.
+- If a `coqcheck_until` request is already in flight, another `emacsclient --eval '(coqcheck_status ...)'` call is itself a second RPC and must be avoided.
+- For active background checks, read the static status file directly or run `./rocqagent-health --skip-ping SERVER`.
 
 ## `coqquery_at_curpoint`
 
@@ -90,7 +94,6 @@ Allowed query prefixes:
 - `Check`
 - `Compute`
 - `Eval`
-- `Show`
 
 ## `save-file`
 
@@ -115,7 +118,8 @@ Semantics:
 
 ## Interrupting a long-running request
 
-`emacsclient --eval` calls are serialized by the Emacs server, so a second `emacsclient` request is not a reliable interrupt mechanism.
+`emacsclient --eval` calls are serialized by the Emacs server, so a second
+`emacsclient` request is not a reliable interrupt mechanism.
 
 Use the shell-visible status file instead:
 - derive the status path directly from the Emacs server name:
@@ -128,6 +132,8 @@ Use the shell-visible status file instead:
 - `touch` that path from the shell
 
 The status path is static for a given Emacs server. The random per-operation path is `:cancel-file`, not the status file.
+- IN ALL CAPS: WHILE A REQUEST IS ACTIVE, DO NOT CALL `rocqagent_status_path()` THROUGH `emacsclient` JUST TO LEARN THE STATUS PATH.
+- Derive the status path from the server name in the shell instead.
 
 While busy, the status file contains a plist of the form:
 - `:busy t`
@@ -179,23 +185,35 @@ Practical rule:
 - Run `./rocqagent-health SERVER` first so you know whether the server is live, dead, or RPC-wedged.
 - Then read the status file, `touch` the cancel file when appropriate, and wait for the operation to stop.
 
+## One RPC At A Time
+
+- IN ALL CAPS: SEND AT MOST ONE `emacsclient` REQUEST AT A TIME TO A GIVEN ROCQAGENT SERVER.
+- If `coqcheck_until` is still running, do not send `coqquery_at_curpoint`, another `coqcheck_until`, or even a trivial `emacsclient --eval '(+ 1 2)'` to the same server.
+- Wait for the active request to finish, or cancel it via the current `:cancel-file`, before sending the next request.
+- For shell-side automation, prefer `./rocqagent-call SERVER ELISP` instead of raw `emacsclient --eval ...`.
+- `./rocqagent-call` refuses to queue a second shell-side request while the server status says `:busy t`.
+- `./rocqagent-call` also refuses to start when another `emacsclient` process is already talking to the same server.
+- `./rocqagent-call` also refuses to mistake a stale `:busy t` status from a dead server for a live busy request.
+- `coqcheck_status` / `rocqagent_status_path()` still exist, but the intended async pattern is: background the synchronous `coqcheck_until` in the shell, then inspect/cancel via the static status file rather than by sending another RPC.
+
 ## Examples
 
 ```sh
-emacsclient --eval '(coqcheck_until "/abs/path/file.v" 120 4 nil)'
-emacsclient --eval '(coqcheck_until "/abs/path/file.v" nil nil t)'
-emacsclient --eval '(rocqagent_status_path())'
-emacsclient --eval '(coqcheck_status)'
-emacsclient --eval '(coqquery_at_curpoint "Check nat." "/abs/path/file.v")'
-emacsclient --eval '(save-file "/abs/path/file.v")'
+./rocqagent-call codex-checkmin25 '(coqcheck_until "/abs/path/file.v" 120 4 nil)'
+./rocqagent-call codex-checkmin25 '(coqcheck_until "/abs/path/file.v" nil nil t)'
+./rocqagent-call codex-checkmin25 '(coqquery_at_curpoint "Check nat." "/abs/path/file.v")'
+./rocqagent-call codex-checkmin25 '(save-file "/abs/path/file.v")'
+./rocqagent-health --skip-ping codex-checkmin25
 ./rocqagent-health codex-checkmin-inline
 ```
 
 Background long-running check from the shell:
 
 ```sh
-emacsclient --eval '(coqcheck_until "/abs/path/file.v" nil nil t)' >/tmp/check.out 2>/tmp/check.err &
-status_file=$(emacsclient --eval '(rocqagent_status_path())' | tr -d '"')
+./rocqagent-call codex-checkmin25 '(coqcheck_until "/abs/path/file.v" nil nil t)' >/tmp/check.out 2>/tmp/check.err &
+status_dir="${TMPDIR:-/tmp}/rocqagent"
+server_tag=$(printf '%s' 'codex-checkmin25' | sed 's/[^[:alnum:]_.-]/_/g')
+status_file="$status_dir/$server_tag.status"
 cat "$status_file"
 ```
 
@@ -207,7 +225,7 @@ cat "$status_file"
   `coqcheck_until`, which incrementally reloads the current file. Do not rely
   on a later `save-file` call to repair a stale buffer state.
 - For query output (`Search`/`Locate`/`Print`/...), first call `coqcheck_until` to the desired point, then call `coqquery_at_curpoint`.
-- For long-running checks, background `coqcheck_until` in the shell and poll `coqcheck_status`.
+- For long-running checks, background `coqcheck_until` in the shell and poll the status file directly or via `./rocqagent-health --skip-ping SERVER`.
 - Use foreground `coqcheck_until` only when you actually want to wait for the answer immediately.
 - Foreground vs background: when to use.
 - `foreground`: cheap local incremental checks, typically `restart=nil`, near the current checked region.

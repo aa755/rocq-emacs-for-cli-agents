@@ -100,7 +100,11 @@
     (rocqagent--control-dir))))
 
 (defun rocqagent_status_path ()
-  "Return the shell-visible status file for the current Emacs server."
+  "Return the shell-visible status file for the current Emacs server.
+
+This is mainly useful when the server is idle. When a request is already
+running, shell callers should derive the path from the server name instead of
+sending another RPC just to ask for it."
   (interactive)
   (rocqagent--status-file))
 
@@ -770,7 +774,12 @@ an error plist instead of a goal plist."
 (defun coqcheck_status (&optional request-id)
   "Return the shell-visible status plist for the current Emacs server.
 
-When REQUEST-ID is non-nil, ensure the returned status corresponds to that id."
+When REQUEST-ID is non-nil, ensure the returned status corresponds to that id.
+
+This is not the shell-side polling API for an already-running request: calling
+it through `emacsclient' while another `coqcheck_until' is still in flight
+would itself be a second RPC. Shell callers should read the static status file
+directly in that case."
   (interactive)
   (condition-case err
       (let* ((path (rocqagent--status-file))

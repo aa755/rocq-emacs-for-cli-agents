@@ -23,17 +23,25 @@ Compared with Emacs MCP servers:
 Public entry points:
 
 - `coqcheck_until(filename, linenum, columnnum, restart)`
-- `coqcheck_status(&optional request_id)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
+- `coqcheck_status(&optional request_id)` when the server is idle and you are already inside an Emacs RPC
+- `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
 
 For long-running checks, run `coqcheck_until` in the background from the shell
-and poll `coqcheck_status`. Status reports include a `:subphase` field, so
+and poll the status file directly, or run `./rocqagent-health --skip-ping SERVER`.
+Status reports include a `:subphase` field, so
 clients can distinguish `restart=t` dependency compilation (`dune-deps`) from
 actual script checking.
 Status files now also record `:server-name`, `:emacs-pid`, `:socket-dir`, and `:socket-path`
 so shell-side tools can distinguish a live daemon from a stale status file.
+
+The static status file is still required even though the internal async API is
+gone: the supported async pattern is to background the synchronous
+`coqcheck_until` from the shell and inspect/cancel it via the status file.
+`coqcheck_status` remains useful as an Elisp helper, but it is not the shell-side
+polling API for an already-busy server because that would itself be another RPC.
 
 When you need to know whether a server is actually reachable, do not trust the
 status file by itself. Run `./rocqagent-health SERVER` instead. It combines:
@@ -49,6 +57,15 @@ This is the intended way to tell apart:
 - stale/dead PID
 - stale/dead socket
 - RPC path wedged even though the status file says `:busy nil`
+
+For agent automation, prefer `./rocqagent-call SERVER ELISP` over raw
+`emacsclient --eval ...`. The wrapper:
+
+- enforces one shell-side RPC at a time per Emacs server
+- refuses to queue another request while `coqcheck_until` is already busy
+- refuses to send a new request when other `emacsclient` processes are already
+  talking to the same server
+- refuses to treat a stale `:busy t` status from a dead server as a live busy request
 
 See [AGENTS.md](AGENTS.md) for the full API contract.
 
