@@ -6,7 +6,6 @@ This repository exposes a small Emacs/Proof-General API for interactive Rocq/Coq
 - `coqcheck_until(filename, linenum, columnnum, restart)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
-- `coqcheck_status(&optional request_id)` when the server is idle and you are already inside an Emacs RPC
 - `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
 
@@ -28,47 +27,6 @@ Semantics:
 - With `restart=nil`, the function reloads the current buffer from disk incrementally before checking: the "checked-region" only reverts till the first character that was changed.
 - With `restart=t`, the file must live under a Dune workspace.
 - At end of file there is usually no open proof, so `:goal` may contain the `Show.` error text rather than a useful goal state.
-
-## `coqcheck_status`
-
-Arguments:
-- `request_id`: optional operation id, typically read from the live status file when the caller backgrounded `coqcheck_until`
-
-Return value:
-- success: `(:ok t ...status fields...)`
-- mismatch / failure: `(:ok nil :error STRING ...)`
-
-Status fields:
-- `:busy t|nil`
-- `:phase running|done|error|canceled|idle`
-- `:subphase dune-deps|checking|query` while running
-- `:id INT`
-- `:kind check|query`
-- `:file STRING`
-- `:target INT`
-- `:locked-end INT`
-- `:cancel-file STRING` while running
-- `:result PLIST` after completion
-- `:server-name STRING`
-- `:emacs-pid INT`
-- `:socket-dir STRING`
-- `:socket-path STRING`
-- `:updated-at FLOAT`
-
-Semantics:
-- `updated-at` is refreshed during long-running checks
-- `locked-end` is refreshed during long-running checks when a proof-script buffer is active; use it to see whether the check is actually advancing through the file
-- `:subphase dune-deps` means a `restart=t` request is still in the `dune coq top` dependency-build phase before Proof General starts advancing through the target script buffer
-- `:subphase checking` means Proof General / Rocq is advancing through the script
-- `:subphase query` means a Rocq query is currently running
-- if a `request_id` is provided, `coqcheck_status` verifies that the status belongs to that request
-- after completion, the final result is embedded under `:result`
-- `:server` is the filesystem-safe status tag; `:server-name` is the actual socket name used by `emacsclient`
-- `coqcheck_status` reports what the server last wrote to disk; it does not by itself prove that `emacsclient` RPCs are still responsive
-- use `./rocqagent-health SERVER` when you need an external liveness check
-- IN ALL CAPS: DO NOT USE `coqcheck_status` AS THE SHELL-SIDE POLLING API FOR A RUNNING REQUEST.
-- If a `coqcheck_until` request is already in flight, another `emacsclient --eval '(coqcheck_status ...)'` call is itself a second RPC and must be avoided.
-- For active background checks, read the static status file directly or run `./rocqagent-health --skip-ping SERVER`.
 
 ## `coqquery_at_curpoint`
 
@@ -132,8 +90,6 @@ Use the shell-visible status file instead:
 - `touch` that path from the shell
 
 The status path is static for a given Emacs server. The random per-operation path is `:cancel-file`, not the status file.
-- IN ALL CAPS: WHILE A REQUEST IS ACTIVE, DO NOT CALL `rocqagent_status_path()` THROUGH `emacsclient` JUST TO LEARN THE STATUS PATH.
-- Derive the status path from the server name in the shell instead.
 
 While busy, the status file contains a plist of the form:
 - `:busy t`
@@ -164,12 +120,12 @@ The running request polls for the cancel token and returns:
 
 - IN ALL CAPS: DO NOT JUST ABANDON THE EMACS SERVER OR KILL THE EMACS SERVER.
 - A wedged `emacsclient` request may still correspond to a live Rocq / Proof General operation inside Emacs.
-- Killing only the Emacs server can leave the underlying Coq / proof-shell process orphaned and still consuming memory/CPU.
+- Killing only the Emacs server can leave the underlying Coq / proof-shell process orphaned and still consuming memory/CPU. 
 
 Use this recovery sequence instead:
 
 1. Inspect the server status file first.
-   - Derive it from the server name as described above, or use `rocqagent_status_path()`.
+   - Derive it from the server name as described above.
 2. Run `./rocqagent-health SERVER`.
    - This combines the status file, recorded Emacs PID, recorded socket path, and a short `emacsclient` ping.
    - Use it to distinguish `busy_live`, `idle_live`, `stale_dead_pid_*`, `stale_dead_socket_*`, and `*_rpc_unresponsive`.
@@ -177,7 +133,7 @@ Use this recovery sequence instead:
 4. Wait for the status file to change to `:phase canceled`, `done`, or `error`.
 5. Only after the active request has been canceled/finished should you consider restarting the Emacs server.
 6. If you truly must restart the server, first check for surviving Rocq / Proof General / `coqtop` subprocesses associated with that server and clean them up deliberately. Do not assume killing Emacs cleaned them up.
-
+   THERE MAY BE OTHER ROCQ/ROCQWORKER/EMACS PROCESSES OF OTHER USERS. NEVER EVER DO KILLALL EMACS OR KILLALL ROCQWORKER...
 Practical rule:
 
 - If a blocking `coqcheck_until` call seems hung, do not start another random Emacs daemon.
@@ -194,7 +150,7 @@ Practical rule:
 - `./rocqagent-call` refuses to queue a second shell-side request while the server status says `:busy t`.
 - `./rocqagent-call` also refuses to start when another `emacsclient` process is already talking to the same server.
 - `./rocqagent-call` also refuses to mistake a stale `:busy t` status from a dead server for a live busy request.
-- `coqcheck_status` / `rocqagent_status_path()` still exist, but the intended async pattern is: background the synchronous `coqcheck_until` in the shell, then inspect/cancel via the static status file rather than by sending another RPC.
+- The intended async pattern is: background the synchronous `coqcheck_until` in the shell, then inspect/cancel via the static status file rather than by sending another RPC.
 
 ## Examples
 

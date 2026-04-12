@@ -99,15 +99,6 @@
     (format "%s-cancel-" (rocqagent--server-tag))
     (rocqagent--control-dir))))
 
-(defun rocqagent_status_path ()
-  "Return the shell-visible status file for the current Emacs server.
-
-This is mainly useful when the server is idle. When a request is already
-running, shell callers should derive the path from the server name instead of
-sending another RPC just to ask for it."
-  (interactive)
-  (rocqagent--status-file))
-
 (defun rocqagent--write-file-atomically (path writer)
   "Write PATH atomically by calling WRITER in a temp buffer and renaming.
 WRITER is called with the temp buffer current."
@@ -770,42 +761,6 @@ an error plist instead of a goal plist."
       (rocqagent--finish-operation
        (and result (rocqagent--classify-final-phase result))
        result))))
-
-(defun coqcheck_status (&optional request-id)
-  "Return the shell-visible status plist for the current Emacs server.
-
-When REQUEST-ID is non-nil, ensure the returned status corresponds to that id.
-
-This is not the shell-side polling API for an already-running request: calling
-it through `emacsclient' while another `coqcheck_until' is still in flight
-would itself be a second RPC. Shell callers should read the static status file
-directly in that case."
-  (interactive)
-  (condition-case err
-      (let* ((path (rocqagent--status-file))
-             (status
-              (if (file-exists-p path)
-                  (with-temp-buffer
-                    (insert-file-contents path)
-                    (read (current-buffer)))
-                (list :busy nil
-                      :phase 'idle
-                      :server (rocqagent--server-tag)
-                      :updated-at (float-time)))))
-        (when (and request-id
-                   (plist-member status :id)
-                   (not (equal (plist-get status :id) request-id)))
-          (setq status
-                (append
-                 (list :ok nil
-                       :error (format "Status is for request %S, not %S"
-                                      (plist-get status :id) request-id))
-                 (list :status status))))
-        (if (plist-member status :ok)
-            status
-          (append (list :ok t) status)))
-    (error
-     (list :ok nil :error (error-message-string err)))))
 
 (defun coqquery_at_curpoint (query filename)
   "Run QUERY at current checked state for FILENAME without changing unwind state.

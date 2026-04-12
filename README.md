@@ -25,7 +25,6 @@ Public entry points:
 - `coqcheck_until(filename, linenum, columnnum, restart)`
 - `coqquery_at_curpoint(query, filename)`
 - `save-file(filename)`
-- `coqcheck_status(&optional request_id)` when the server is idle and you are already inside an Emacs RPC
 - `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
 
@@ -40,8 +39,6 @@ so shell-side tools can distinguish a live daemon from a stale status file.
 The static status file is still required even though the internal async API is
 gone: the supported async pattern is to background the synchronous
 `coqcheck_until` from the shell and inspect/cancel it via the status file.
-`coqcheck_status` remains useful as an Elisp helper, but it is not the shell-side
-polling API for an already-busy server because that would itself be another RPC.
 
 When you need to know whether a server is actually reachable, do not trust the
 status file by itself. Run `./rocqagent-health SERVER` instead. It combines:
