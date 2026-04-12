@@ -99,6 +99,48 @@
     (format "%s-cancel-" (rocqagent--server-tag))
     (rocqagent--control-dir))))
 
+(defun rocqagent--process-pid (&optional proc)
+  "Return the OS PID of PROC when available."
+  (when (and (processp proc)
+             (process-live-p proc)
+             (fboundp 'process-id))
+    (process-id proc)))
+
+(defun rocqagent--process-comm-from-pid (pid)
+  "Return the kernel command name for PID when available."
+  (when (and (integerp pid) (> pid 0))
+    (let ((attrs (ignore-errors (process-attributes pid))))
+      (when attrs
+        (cdr (assq 'comm attrs))))))
+
+(defun rocqagent--linux-pid-startticks (pid)
+  "Return Linux `/proc/<pid>/stat` start-time ticks for PID, or nil."
+  (when (and (integerp pid) (> pid 0))
+    (let ((path (format "/proc/%d/stat" pid)))
+      (when (file-readable-p path)
+        (with-temp-buffer
+          (insert-file-contents path)
+          (let* ((text (buffer-string))
+                 (close (cl-position ?\) text :from-end t)))
+            (when close
+              (let* ((rest (substring text (+ close 2)))
+                     (fields (split-string rest " " t)))
+                ;; rest starts at stat field 3 (state), so field 22 is index 19.
+                (when (> (length fields) 19)
+                  (string-to-number (nth 19 fields)))))))))))
+
+(defun rocqagent--tracked-process-plist (prefix pid)
+  "Return status plist entries for PID under PREFIX."
+  (let ((comm (rocqagent--process-comm-from-pid pid))
+        (startticks (rocqagent--linux-pid-startticks pid)))
+    (append
+     (when pid
+       (list (intern (format ":%s-pid" prefix)) pid))
+     (when comm
+       (list (intern (format ":%s-comm" prefix)) comm))
+     (when startticks
+       (list (intern (format ":%s-startticks" prefix)) startticks)))))
+
 (defun rocqagent--write-file-atomically (path writer)
   "Write PATH atomically by calling WRITER in a temp buffer and renaming.
 WRITER is called with the temp buffer current."
@@ -125,7 +167,10 @@ WRITER is called with the temp buffer current."
   (let ((path (or rocqagent--active-status-file
                   (rocqagent--status-file)))
         (socket-dir (rocqagent--socket-dir))
-        (socket-path (rocqagent--socket-path)))
+        (socket-path (rocqagent--socket-path))
+        (emacs-pid (emacs-pid))
+        (proof-pid (rocqagent--process-pid (rocqagent--proof-shell-process)))
+        (active-pid (rocqagent--process-pid rocqagent--active-process)))
     (rocqagent--write-file-atomically
      path
      (lambda ()
@@ -136,8 +181,11 @@ WRITER is called with the temp buffer current."
             plist
             (list :server (rocqagent--server-tag)
                   :server-name (rocqagent--server-socket-name)
-                  :emacs-pid (emacs-pid)
-                  :socket-dir socket-dir
+                  :emacs-pid emacs-pid)
+            (rocqagent--tracked-process-plist "emacs" emacs-pid)
+            (rocqagent--tracked-process-plist "proof" proof-pid)
+            (rocqagent--tracked-process-plist "active" active-pid)
+            (list :socket-dir socket-dir
                   :socket-path socket-path
                   :updated-at (float-time)))
            (current-buffer)))))
@@ -910,6 +958,24 @@ Return shape:
                 (set-visited-file-modtime)
                 (set-buffer-modified-p nil)))))
       (kill-buffer tmp))))
+
+(defun rocqagent_shutdown_server ()
+  "Gracefully stop the current Proof General session and exit this Emacs server.
+
+This is intended to be called through a dedicated cleanup path, not as a normal
+proof RPC."
+  (interactive)
+  (setq rocqagent--cancel-requested t)
+  (ignore-errors
+    (rocqagent--signal-interrupt t))
+  (when (process-live-p rocqagent--active-process)
+    (ignore-errors
+      (kill-process rocqagent--active-process)))
+  (when (and (boundp 'proof-shell-buffer)
+             (buffer-live-p proof-shell-buffer))
+    (ignore-errors
+      (proof-shell-exit t)))
+  (kill-emacs 0))
 
 (when (fboundp 'rocqagent_interrupt)
   (fmakunbound 'rocqagent_interrupt))

@@ -5,6 +5,7 @@ This repository exposes a small Emacs/Proof-General API for interactive Rocq/Coq
 
 - `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
+- `./rocqagent-cleanup SERVER`
 
 ## `rocqagent-call`
 
@@ -99,6 +100,22 @@ It is the supported way to distinguish:
 - stale dead PID/socket
 - RPC-unresponsive server
 
+## `rocqagent-cleanup`
+
+Use `./rocqagent-cleanup SERVER` to tear down one rocqagent server safely on Linux.
+
+It does this in order:
+- touch the current `:cancel-file` if the server is busy
+- if the server is still responsive, call the graceful Proof General shutdown path
+- if anything remains, kill only the validated process roots for that server and their descendants
+
+The targeted roots are:
+- the exact Emacs server PID for that server
+- the tracked proof shell PID for that server
+- the tracked active worker PID for that server
+
+The implementation validates Linux start-time ticks from the status file before using recorded PIDs, so stale status files do not cause it to kill a reused unrelated PID.
+
 
 ## Interrupting a long-running request
 
@@ -177,6 +194,7 @@ Practical rule:
 - `./rocqagent-call` also refuses to start when another `emacsclient` process is already talking to the same server.
 - `./rocqagent-call` also refuses to mistake a stale `:busy t` status from a dead server for a live busy request.
 - The intended async pattern is: background the synchronous `coqcheck_until` in the shell, then inspect/cancel via the static status file rather than by sending another RPC.
+- When a server really needs to be torn down, use `./rocqagent-cleanup SERVER` rather than ad hoc `kill` / `killall`.
 
 ## Examples
 
@@ -187,6 +205,7 @@ Practical rule:
 ./rocqagent-call codex-checkmin25 '(save-file "/abs/path/file.v")'
 ./rocqagent-health --skip-ping codex-checkmin25
 ./rocqagent-health codex-checkmin-inline
+./rocqagent-cleanup codex-checkmin25
 ```
 
 Background long-running check from the shell:

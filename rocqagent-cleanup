@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Safely clean up one rocqagent Emacs server and its tracked subprocess tree.
+
+Linux-only. The cleanup strategy is:
+
+1. If the server is busy, touch its current cancel-file and wait briefly.
+2. If the server is still responsive, ask Proof General / Emacs to shut down
+   gracefully via `rocqagent_shutdown_server`.
+3. If anything remains, kill only the validated process roots recorded for this
+   server (Emacs, proof shell, tracked active subprocess) and their descendants.
+
+This never kills by process name globally. It only kills:
+- the exact Emacs server process for the requested server
+- descendants of that Emacs process
+- tracked proof/worker roots recorded by that same server's status file
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+REPO_DIR = Path(__file__).resolve().parent
+HEALTH = REPO_DIR / "rocqagent-health"
+CONTROL_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "rocqagent"
+PROOF_NAMES = {"coqtop", "rocqtop", "rocqworker"}
+
+
+def server_tag(server: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in "_.-") else "_" for ch in server)
+
+
+def rpc_lock_path(server: str) -> Path:
+    return CONTROL_DIR / f"{server_tag(server)}.rpc.lock"
+
+
+def run_health(server: str, *, skip_ping: bool) -> dict:
+    cmd = [str(HEALTH)]
+    if skip_ping:
+        cmd.append("--skip-ping")
+    cmd.append(server)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "rocqagent-health failed")
+    return json.loads(proc.stdout)
+
+
+def proc_stat(pid: int) -> dict | None:
+    path = Path(f"/proc/{pid}/stat")
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    close = text.rfind(")")
+    if close < 0:
+        return None
+    comm = text[text.find("(") + 1:close]
+    rest = text[close + 2 :].split()
+    if len(rest) <= 19:
+        return None
+    return {
+        "pid": pid,
+        "comm": comm,
+        "ppid": int(rest[1]),
+        "startticks": int(rest[19]),
+    }
+
+
+def pid_live(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def matching_daemon_pids(server: str) -> list[int]:
+    proc = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, check=True)
+    pids: list[int] = []
+    needle_eq = f"--daemon={server}"
+    needle_sep = f"--daemon {server}"
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_text, _, args_text = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if needle_eq in args_text or needle_sep in args_text:
+            pids.append(pid)
+    return pids
+
+
+def verified_root_pid(snapshot: dict, prefix: str, *, comm_prefix: str | None = None,
+                      allowed_names: set[str] | None = None) -> int | None:
+    pid = snapshot.get(f"{prefix}_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    stat = proc_stat(pid)
+    if not stat:
+        return None
+    expected_start = snapshot.get(f"{prefix}_startticks")
+    if isinstance(expected_start, int) and stat["startticks"] != expected_start:
+        return None
+    expected_comm = snapshot.get(f"{prefix}_comm")
+    if expected_comm and stat["comm"] != expected_comm:
+        return None
+    if comm_prefix and not stat["comm"].startswith(comm_prefix):
+        return None
+    if allowed_names and stat["comm"] not in allowed_names:
+        return None
+    return pid
+
+
+def descendant_map() -> tuple[dict[int, list[int]], dict[int, dict]]:
+    children: dict[int, list[int]] = {}
+    stats: dict[int, dict] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        stat = proc_stat(pid)
+        if not stat:
+            continue
+        stats[pid] = stat
+        children.setdefault(stat["ppid"], []).append(pid)
+    return children, stats
+
+
+def collect_descendants(roots: list[int]) -> tuple[set[int], dict[int, int]]:
+    children, _stats = descendant_map()
+    seen: set[int] = set()
+    depth: dict[int, int] = {}
+    queue: list[tuple[int, int]] = [(pid, 0) for pid in roots]
+    while queue:
+        pid, d = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        depth[pid] = d
+        for child in children.get(pid, []):
+            queue.append((child, d + 1))
+    return seen, depth
+
+
+def ordered_targets(targets: set[int], depth: dict[int, int], emacs_pid: int | None) -> list[int]:
+    return sorted(targets, key=lambda pid: (pid == emacs_pid, -depth.get(pid, 0), pid))
+
+
+def signal_pids(pids: list[int], sig: signal.Signals) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+
+def wait_gone(pids: list[int], timeout_s: float) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not any(pid_live(pid) for pid in pids):
+            return True
+        time.sleep(0.1)
+    return not any(pid_live(pid) for pid in pids)
+
+
+def try_cancel(snapshot: dict, wait_s: float) -> dict:
+    cancel_file = snapshot.get("cancel_file")
+    if snapshot.get("busy") and cancel_file:
+        Path(cancel_file).touch()
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            snap = run_health(snapshot["server_name"], skip_ping=True)
+            if not snap.get("busy"):
+                return snap
+            time.sleep(0.1)
+    return snapshot
+
+
+def try_graceful_shutdown(server: str, timeout_s: float) -> None:
+    subprocess.run(
+        ["emacsclient", "-s", server, "--eval", "(rocqagent_shutdown_server)"],
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        check=False,
+    )
+
+
+def cleanup_side_files(snapshot: dict) -> None:
+    for key in ("cancel_file", "status_file"):
+        path = snapshot.get(key)
+        if isinstance(path, str) and path:
+            try:
+                Path(path).unlink()
+            except FileNotFoundError:
+                pass
+    socket_path = snapshot.get("socket_path")
+    if isinstance(socket_path, str) and socket_path:
+        try:
+            Path(socket_path).unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        rpc_lock_path(snapshot["server_name"]).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("server", help="Emacs server name")
+    parser.add_argument("--cancel-wait", type=float, default=5.0,
+                        help="Seconds to wait after touching the cancel-file")
+    parser.add_argument("--graceful-timeout", type=float, default=5.0,
+                        help="Seconds to wait for graceful Emacs shutdown RPC")
+    parser.add_argument("--term-wait", type=float, default=3.0,
+                        help="Seconds to wait after SIGTERM before SIGKILL")
+    args = parser.parse_args(argv)
+
+    if sys.platform != "linux":
+        print("rocqagent-cleanup: Linux-only", file=sys.stderr)
+        return 2
+
+    snapshot = run_health(args.server, skip_ping=True)
+    snapshot = try_cancel(snapshot, args.cancel_wait)
+
+    live_snapshot = run_health(args.server, skip_ping=False)
+    health = live_snapshot.get("health")
+    if health in {"idle_live", "live_no_status"}:
+        try:
+            try_graceful_shutdown(args.server, args.graceful_timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(0.5)
+        live_snapshot = run_health(args.server, skip_ping=True)
+
+    emacs_pid = verified_root_pid(live_snapshot, "emacs", comm_prefix="emacs")
+    if emacs_pid is None:
+        daemon_pids = matching_daemon_pids(args.server)
+        if len(daemon_pids) == 1:
+            emacs_pid = daemon_pids[0]
+
+    proof_pid = verified_root_pid(live_snapshot, "proof", allowed_names=PROOF_NAMES)
+    active_pid = verified_root_pid(live_snapshot, "active")
+
+    roots = [pid for pid in (emacs_pid, proof_pid, active_pid) if pid]
+    if roots:
+        targets, depth = collect_descendants(roots)
+        kill_order = ordered_targets(targets, depth, emacs_pid)
+        signal_pids(kill_order, signal.SIGTERM)
+        if not wait_gone(kill_order, args.term_wait):
+            signal_pids(kill_order, signal.SIGKILL)
+            wait_gone(kill_order, 1.0)
+
+    final_snapshot = run_health(args.server, skip_ping=False)
+    if final_snapshot.get("health") in {
+        "stale_dead_pid_idle",
+        "stale_dead_pid_busy",
+        "stale_dead_socket_idle",
+        "stale_dead_socket_busy",
+        "no_status_dead_socket",
+    } or not any(pid_live(pid) for pid in roots):
+        cleanup_side_files(final_snapshot if final_snapshot.get("status_file") else live_snapshot)
+
+    print(json.dumps({
+        "ok": True,
+        "server": args.server,
+        "roots": {
+            "emacs_pid": emacs_pid,
+            "proof_pid": proof_pid,
+            "active_pid": active_pid,
+        },
+        "final_health": final_snapshot.get("health"),
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

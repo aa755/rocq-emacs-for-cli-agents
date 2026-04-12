@@ -24,12 +24,21 @@ Public entry points:
 
 - `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
+- `./rocqagent-cleanup SERVER`
 
 The supported `ELISP` payloads for `rocqagent-call` are:
 
 - `'(coqcheck_until FILENAME LINENUM COLUMNNUM RESTART)'`
 - `'(coqquery_at_curpoint QUERY FILENAME)'`
 - `'(save-file FILENAME)'`
+
+`./rocqagent-cleanup SERVER` is the server-specific cleanup path on Linux. It:
+
+- touches the current cancel-file when a request is busy
+- tries the graceful Proof General shutdown path first
+- falls back to killing only the validated process roots for that server and their descendants
+
+It does not kill other Emacs servers or unrelated Rocq processes.
 
 For long-running checks, run `coqcheck_until` in the background from the shell
 and poll the status file directly, or run `./rocqagent-health --skip-ping SERVER`.
