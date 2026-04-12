@@ -22,11 +22,14 @@ Compared with Emacs MCP servers:
 
 Public entry points:
 
-- `coqcheck_until(filename, linenum, columnnum, restart)`
-- `coqquery_at_curpoint(query, filename)`
-- `save-file(filename)`
 - `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
+
+The supported `ELISP` payloads for `rocqagent-call` are:
+
+- `'(coqcheck_until FILENAME LINENUM COLUMNNUM RESTART)'`
+- `'(coqquery_at_curpoint QUERY FILENAME)'`
+- `'(save-file FILENAME)'`
 
 For long-running checks, run `coqcheck_until` in the background from the shell
 and poll the status file directly, or run `./rocqagent-health --skip-ping SERVER`.

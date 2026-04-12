@@ -3,11 +3,23 @@ This repository exposes a small Emacs/Proof-General API for interactive Rocq/Coq
 
 ## Entry points
 
-- `coqcheck_until(filename, linenum, columnnum, restart)`
-- `coqquery_at_curpoint(query, filename)`
-- `save-file(filename)`
 - `./rocqagent-call SERVER ELISP`
 - `./rocqagent-health [SERVER]`
+
+## `rocqagent-call`
+
+Use `./rocqagent-call SERVER ELISP` as the only shell entry point for Emacs RPCs.
+
+The supported `ELISP` expressions are:
+- `'(coqcheck_until FILENAME LINENUM COLUMNNUM RESTART)'`
+- `'(coqquery_at_curpoint QUERY FILENAME)'`
+- `'(save-file FILENAME)'`
+
+`rocqagent-call`:
+- serializes shell-side RPCs per Emacs server
+- refuses a second request while a check is already running
+- refuses if another raw `emacsclient` process is already talking to the same server
+- refuses stale dead-server cases that would otherwise look live
 
 ## `coqcheck_until`
 
@@ -72,6 +84,20 @@ Semantics:
 - The main purpose of `save-file` is to avoid clobbering newer buffer contents
   with shell-side edits. This is a required precondition for mixed
   Emacs+shell workflows.
+
+## `rocqagent-health`
+
+Use `./rocqagent-health [SERVER]` for shell-side diagnosis. It combines:
+- the static status file
+- the recorded Emacs PID
+- the expected socket path
+- an optional `emacsclient` ping
+
+It is the supported way to distinguish:
+- live and responsive
+- live but busy
+- stale dead PID/socket
+- RPC-unresponsive server
 
 
 ## Interrupting a long-running request
