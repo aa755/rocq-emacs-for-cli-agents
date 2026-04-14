@@ -646,14 +646,22 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
        (current-buffer)))
   (redisplay t))
 
-(defun my-coq--result-at-target (target-point &optional forced-error)
+(defun my-coq--result-at-target (target-point &optional forced-error initial-locked-end)
   "Return API result plist based on TARGET-POINT in current buffer.
-When FORCED-ERROR is non-nil, always return an error plist."
+When FORCED-ERROR is non-nil, always return an error plist.
+INITIAL-LOCKED-END is the checked frontier before the current `proof-goto-point'
+attempt.  When TARGET-POINT is behind that frontier, Proof General retracts to
+the nearest command boundary at or before TARGET-POINT, so success is
+`locked-end <= TARGET-POINT' rather than `locked-end >= TARGET-POINT'."
   (let* ((locked-end (if (fboundp 'proof-unprocessed-begin)
                          (proof-unprocessed-begin)
                        (point-min)))
-         (target-reached (or (null target-point)
-                             (>= locked-end target-point)))
+         (target-reached
+          (or (null target-point)
+              (if (and initial-locked-end
+                       (< target-point initial-locked-end))
+                  (<= locked-end target-point)
+                (>= locked-end target-point))))
          (error-text (my-coq--last-error-string)))
     (cond
      ((eq proof-shell-last-output-kind 'interrupt)
@@ -730,7 +738,8 @@ When FORCED-ERROR is non-nil, always return an error plist."
               ;; Avoid interactive PG prompts in non-interactive API calls.
               (let ((proof-query-file-save-when-activating-scripting nil)
                     (proof-auto-action-when-deactivating-scripting 'retract)
-                    (restart-result nil))
+                    (restart-result nil)
+                    (initial-locked-end nil))
                 (rocqagent--claim-process-thread)
                 (rocqagent--maybe-handle-cancel buf)
                 (when (and (boundp 'proof-shell-busy) proof-shell-busy
@@ -742,6 +751,10 @@ When FORCED-ERROR is non-nil, always return an error plist."
                       (my-coq--target-point-from-line-column
                        linenum columnnum))
                 (setq rocqagent--active-target target-point)
+                (setq initial-locked-end
+                      (if (fboundp 'proof-unprocessed-begin)
+                          (proof-unprocessed-begin)
+                        (point-min)))
                 (if reuse
                     (unless (= target-point (proof-unprocessed-begin))
                       (my-coq--goto-safe-processing-point target-point)
@@ -768,7 +781,8 @@ When FORCED-ERROR is non-nil, always return an error plist."
                   (my-coq--result-at-target
                    target-point
                    (and (not reuse)
-                        (not (my-coq--coq-active-buffer-p buf)))))))))
+                        (not (my-coq--coq-active-buffer-p buf)))
+                   initial-locked-end))))))
       (rocqagent-interrupted
        (my-coq--interrupted-result
         (and (buffer-live-p buf)
