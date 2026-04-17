@@ -246,6 +246,14 @@ cat "$status_file"
 - Use `restart=t` iff some other `.v` dependency of the current file changed since the last successful check.
   Current-file edits do not justify `restart=t`: `coqcheck_until(..., restart=nil)` already does an incremental reload of the current buffer/file before checking.
   In particular, shell-editing the current file is still a `restart=nil` case.
+- IN ALL CAPS: `restart=t` IS A ONE-SHOT RECOVERY FOR DEPENDENCY CHANGES, NOT A
+  MODE YOU STAY IN.
+- AFTER YOU HAVE SUCCESSFULLY DONE THE DEPENDENCY-REFRESHING CHECK WITH
+  `restart=t`, ALL SUBSEQUENT CHECKS MUST GO BACK TO `restart=nil` UNLESS SOME
+  OTHER IMPORTED `.v` FILE CHANGED AGAIN.
+- DO NOT KEEP USING `restart=t` JUST BECAUSE A DEPENDENCY CHANGED EARLIER IN
+  THE SESSION. ONCE THAT CHANGE HAS BEEN INCORPORATED BY A SUCCESSFUL RESTARTED
+  CHECK, FURTHER CURRENT-FILE-ONLY ITERATION IS AGAIN A `restart=nil` CASE.
 - Once you request `restart=t`, let that restart/recheck finish before editing the current proof file again. Do not edit the file mid-restart. In particular, do not edit `dippedlam.v` while a restart-triggered recheck/build is in flight: the checker / `dune` may read the file while constructing the dependency graph, and mid-build edits can desynchronize what is being checked.
 - A long-running `restart=t` request is expected: `dune coq top` may rebuild dependencies before it gets back to the target file. Do not cancel a `restart=t` request merely because it is slow. Use the cancel-file only when the request is clearly wedged or has become obsolete.
 - Before every `coqcheck_until` call, do this decision check explicitly:
