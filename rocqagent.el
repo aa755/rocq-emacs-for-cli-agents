@@ -434,7 +434,7 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
            (proc (start-file-process
                   "rocqagent-dune-top"
                   dune-buffer
-                  "dune" "coq" "top" "--toplevel=true"
+                  "dune" "rocq" "top" "--toplevel=true"
                   (file-relative-name vfilename proot)))
            (retcode nil))
       (setq rocqagent--active-process proc)
@@ -449,9 +449,9 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
             (list :ok t))
         (list :ok nil
               :error (let ((text (rocqagent--buffer-string dune-buffer)))
-                       (if (> (length text) 0)
-                           text
-                         (format "dune coq top failed with exit code %s" retcode)))
+                         (if (> (length text) 0)
+                             text
+                         (format "dune rocq top failed with exit code %s" retcode)))
               :retcode retcode
               :source 'dune-top)))))
 
