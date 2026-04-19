@@ -47,6 +47,9 @@
 (defvar rocqagent--active-subphase nil
   "Current finer-grained phase for the active operation, or nil.")
 
+(defvar-local rocqagent--needs-recovery-after-interrupt nil
+  "Non-nil when the current Rocq buffer should repair state after an interrupt.")
+
 (defun rocqagent--control-dir ()
   "Return the directory that stores rocqagent control files."
   (let ((dir (expand-file-name "rocqagent" temporary-file-directory)))
@@ -342,6 +345,39 @@ PHASE defaults to `done'. RESULT, when non-nil, is stored in the status file."
                (process-live-p p)
                (fboundp 'set-process-thread))
       (set-process-thread p nil))))
+
+(defun rocqagent--note-interrupted-buffer (&optional buf)
+  "Mark BUF as needing bounded recovery before the next reused check."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (setq rocqagent--needs-recovery-after-interrupt t))))
+
+(defun rocqagent--clear-shell-result-state ()
+  "Clear stale Proof General output state in the current scripting session."
+  (when (boundp 'proof-shell-last-output-kind)
+    (setq proof-shell-last-output-kind nil))
+  (when (boundp 'proof-shell-last-output)
+    (setq proof-shell-last-output nil))
+  (when (boundp 'proof-shell-interrupt-pending)
+    (setq proof-shell-interrupt-pending nil))
+  (when (buffer-live-p proof-response-buffer)
+    (with-current-buffer proof-response-buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)))))
+
+(defun rocqagent--recover-after-interrupt-if-needed (buf)
+  "Repair BUF after an interrupted request before reusing the live session."
+  (when (and (buffer-live-p buf)
+             (with-current-buffer buf
+               rocqagent--needs-recovery-after-interrupt))
+    (with-current-buffer buf
+      (rocqagent--clear-shell-result-state)
+      (when (and (fboundp 'proof-locked-region-empty-p)
+                 (not (proof-locked-region-empty-p)))
+        (proof-undo-last-successful-command)
+        (my-coq--wait-for-proof-shell-with-ui buf))
+      (rocqagent--clear-shell-result-state)
+      (setq rocqagent--needs-recovery-after-interrupt nil))))
 
 (defun rocqagent--signal-interrupt (&optional hard)
   "Interrupt the active rocqagent operation.
@@ -755,6 +791,12 @@ the nearest command boundary at or before TARGET-POINT, so success is
                       (if (fboundp 'proof-unprocessed-begin)
                           (proof-unprocessed-begin)
                         (point-min)))
+                (when reuse
+                  (rocqagent--recover-after-interrupt-if-needed buf)
+                  (setq initial-locked-end
+                        (if (fboundp 'proof-unprocessed-begin)
+                            (proof-unprocessed-begin)
+                          (point-min))))
                 (if reuse
                     (unless (= target-point (proof-unprocessed-begin))
                       (my-coq--goto-safe-processing-point target-point)
@@ -770,6 +812,9 @@ the nearest command boundary at or before TARGET-POINT, so success is
                                (boundp 'proof-shell-busy) proof-shell-busy
                                (fboundp 'proof-shell-wait))
                       (my-coq--wait-for-proof-shell-with-ui buf))))
+                (when (plist-get (or restart-result '(:ok t)) :ok)
+                  (setq rocqagent--needs-recovery-after-interrupt nil)
+                  (rocqagent--clear-shell-result-state))
                 (if (and restart-result
                          (not (plist-get restart-result :ok)))
                     (append
@@ -784,6 +829,7 @@ the nearest command boundary at or before TARGET-POINT, so success is
                         (not (my-coq--coq-active-buffer-p buf)))
                    initial-locked-end))))))
       (rocqagent-interrupted
+       (rocqagent--note-interrupted-buffer buf)
        (my-coq--interrupted-result
         (and (buffer-live-p buf)
              (with-current-buffer buf
@@ -865,6 +911,11 @@ Return shape:
                             (if (fboundp 'proof-unprocessed-begin)
                                 (proof-unprocessed-begin)
                               (point-min)))
+                      (rocqagent--recover-after-interrupt-if-needed buf)
+                      (setq locked-before
+                            (if (fboundp 'proof-unprocessed-begin)
+                                (proof-unprocessed-begin)
+                              (point-min)))
                       (when (and (boundp 'proof-shell-busy) proof-shell-busy)
                         (my-coq--wait-for-proof-shell-with-ui buf))
                       (unless (fboundp 'proof-shell-invisible-command)
@@ -903,10 +954,13 @@ Return shape:
                                        (my-coq--last-error-string))
                               :locked-end locked-before))
                        (t
+                        (setq rocqagent--needs-recovery-after-interrupt nil)
+                        (rocqagent--clear-shell-result-state)
                         (list :ok t
                               :query query-output
                               :locked-end locked-before)))))))
             (rocqagent-interrupted
+             (rocqagent--note-interrupted-buffer buf)
              (my-coq--interrupted-result locked-before))
             (error
              (list :ok nil :error (error-message-string err))))
