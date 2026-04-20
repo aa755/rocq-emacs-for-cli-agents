@@ -47,6 +47,14 @@
 (defvar rocqagent--active-subphase nil
   "Current finer-grained phase for the active operation, or nil.")
 
+(defvar rocqagent-preserve-session-on-noop-restart t
+  "When non-nil, preserve a live Coq session on a no-op `restart=t` request.
+
+The fast path applies only when `dune rocq top' exits successfully without
+showing any Rocq source compilation in `*compile-deps-dune*'.  Setting this to
+nil restores the older behavior that always tears down the live session during
+`restart=t'.")
+
 (defvar-local rocqagent--needs-recovery-after-interrupt nil
   "Non-nil when the current Rocq buffer should repair state after an interrupt.")
 
@@ -511,7 +519,8 @@ and COLUMNNUM."
           (setq rocqagent--active-process nil)))
       (setq compiled-v (rocqagent--dune-compiled-v-p dune-buffer))
       (cond
-       ((and (eq retcode 0)
+       ((and rocqagent-preserve-session-on-noop-restart
+             (eq retcode 0)
              had-live-session
              (not compiled-v))
         (list :ok t :preserved-session t :compiled-v nil))
