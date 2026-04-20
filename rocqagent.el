@@ -448,48 +448,101 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
          (buffer-substring-no-properties (point-min) (point-max))))
     ""))
 
-(defun reload-to-current-point_aux (vfilename vfilebuf _syncCIDuneCacheFirst)
-  "Restart Rocq for VFILENAME and process to point in VFILEBUF."
+(defun rocqagent--dune-compiled-v-p (buf)
+  "Return non-nil when BUF shows Dune compiled at least one Rocq source file."
+  (and (buffer-live-p buf)
+       (with-current-buffer buf
+         (save-excursion
+           (goto-char (point-min))
+           (let ((found nil))
+             (while (and (not found) (not (eobp)))
+               (let ((line (buffer-substring-no-properties
+                            (line-beginning-position)
+                            (line-end-position))))
+                 (setq found
+                       (not
+                        (null
+                         (and
+                          (string-match-p
+                           "^[[:space:]]*\\(?:coq\\|rocq\\)\\(?:c\\)?[[:space:]]"
+                           line)
+                          (or (string-match-p
+                               "\\.{[^}\n]*\\<\\(?:vo\\|vos\\|vok\\|vio\\)\\>[^}\n]*}"
+                               line)
+                              (string-match-p
+                               "\\.\\(?:vo\\|vos\\|vok\\|vio\\)\\>"
+                               line)))))))
+               (forward-line 1))
+             found)))))
+
+(defun reload-to-current-point_aux (vfilename vfilebuf linenum columnnum _syncCIDuneCacheFirst)
+  "Run `dune rocq top' for VFILENAME before checking VFILEBUF.
+
+When Dune succeeds without compiling any Rocq source file and VFILEBUF already
+has a live scripting session, preserve that session and let the caller follow
+the normal incremental reload path.  Otherwise, sync VFILEBUF from disk,
+restart the scripting session, and process to the target described by LINENUM
+and COLUMNNUM."
   (interactive)
-  (when (= (point) (point-min))
-    ;; If the file was just opened, checking to EOF is usually intended.
-    (goto-char (point-max)))
-  (when (buffer-live-p proof-shell-buffer)
-    (proof-shell-exit t))
   (let* ((dune-buffer (get-buffer-create "*compile-deps-dune*"))
-         (proot (find-root (buffer-file-name))))
+         (proot (find-root (buffer-file-name)))
+         (had-live-session (my-coq--coq-active-buffer-p vfilebuf))
+         (retcode nil)
+         (compiled-v nil)
+         (target-point nil))
     (with-current-buffer dune-buffer
       (compilation-mode)
       (read-only-mode -1)
       (setq default-directory proot)
       (erase-buffer)
       (goto-char (point-max)))
-    (switch-to-buffer dune-buffer)
+    (display-buffer dune-buffer)
     (rocqagent--maybe-handle-cancel vfilebuf)
     (let* ((default-directory proot)
            (proc (start-file-process
                   "rocqagent-dune-top"
                   dune-buffer
                   "dune" "rocq" "top" "--toplevel=true"
-                  (file-relative-name vfilename proot)))
-           (retcode nil))
+                  (file-relative-name vfilename proot))))
       (setq rocqagent--active-process proc)
       (unwind-protect
           (setq retcode (rocqagent--wait-for-process-with-ui proc vfilebuf))
         (when (eq rocqagent--active-process proc)
           (setq rocqagent--active-process nil)))
-      (if (eq retcode 0)
-          (progn
-            (switch-to-buffer vfilebuf)
-            (proof-goto-point)
-            (list :ok t))
-        (list :ok nil
-              :error (let ((text (rocqagent--buffer-string dune-buffer)))
+      (setq compiled-v (rocqagent--dune-compiled-v-p dune-buffer))
+      (cond
+       ((and (eq retcode 0)
+             had-live-session
+             (not compiled-v))
+        (list :ok t :preserved-session t :compiled-v nil))
+       (t
+        (with-current-buffer vfilebuf
+          (coq-partial-revert-buffer)
+          (setq target-point
+                (my-coq--target-point-from-line-column
+                 linenum columnnum))
+          (my-coq--goto-safe-processing-point target-point))
+        (when (with-current-buffer vfilebuf
+                (buffer-live-p proof-shell-buffer))
+          (with-current-buffer vfilebuf
+            (proof-shell-exit t)))
+        (if (eq retcode 0)
+            (progn
+              (display-buffer vfilebuf)
+              (with-current-buffer vfilebuf
+                (proof-goto-point))
+              (list :ok t
+                    :target target-point
+                    :compiled-v compiled-v))
+          (list :ok nil
+                :error (let ((text (rocqagent--buffer-string dune-buffer)))
                          (if (> (length text) 0)
                              text
-                         (format "dune rocq top failed with exit code %s" retcode)))
-              :retcode retcode
-              :source 'dune-top)))))
+                           (format "dune rocq top failed with exit code %s" retcode)))
+                :retcode retcode
+                :source 'dune-top
+                :compiled-v compiled-v
+                :target target-point)))))))
 
 (defun my-coq--none-like-p (x)
   "Return non-nil when X means \"no value\" for API callers."
@@ -569,30 +622,43 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
          (1- clamped)
        clamped))))
 
+(defun my-coq--proof-active-p ()
+  "Return non-nil when the current scripting state is inside an open proof."
+  (and (eq major-mode 'coq-mode)
+       (boundp 'proof-script-buffer)
+       (eq proof-script-buffer (current-buffer))
+       (buffer-live-p proof-shell-buffer)
+       (numberp proof-nesting-depth)
+       (> proof-nesting-depth 0)))
+
 (defun my-coq--goals-string ()
-  "Return plain-text goal buffer contents."
-  (let ((goals
-         (if (buffer-live-p proof-goals-buffer)
-             (with-current-buffer proof-goals-buffer
-               (string-trim
-                (buffer-substring-no-properties (point-min) (point-max))))
-           "")))
-    (if (> (length goals) 0)
-        goals
-      (condition-case _err
-          (let* ((raw (and (fboundp 'proof-shell-invisible-command)
-                           (my-coq--run-invisible-command-with-ui
-                            "Show."
-                            'no-response-display
-                            'no-error-display)))
-                 (plain (if (and (stringp raw)
-                                 (fboundp 'proof-shell-strip-output-markup))
-                            (proof-shell-strip-output-markup raw)
-                          raw)))
-            (if (stringp plain)
-                (string-trim plain)
-              ""))
-        (error "")))))
+  "Return plain-text goal buffer contents for the current active proof, or nil."
+  (when (my-coq--proof-active-p)
+    (let ((goals
+           (if (buffer-live-p proof-goals-buffer)
+               (with-current-buffer proof-goals-buffer
+                 (string-trim
+                  (buffer-substring-no-properties (point-min) (point-max))))
+             "")))
+      (if (> (length goals) 0)
+          goals
+        (condition-case _err
+            (let* ((raw (and (fboundp 'proof-shell-invisible-command)
+                             (my-coq--run-invisible-command-with-ui
+                              "Show."
+                              'no-response-display
+                              'no-error-display)))
+                   (plain (if (and (stringp raw)
+                                   (fboundp 'proof-shell-strip-output-markup))
+                              (proof-shell-strip-output-markup raw)
+                            raw))
+                   (trimmed (if (stringp plain)
+                                (string-trim plain)
+                              "")))
+              (unless (or (= (length trimmed) 0)
+                          (string-match-p "This command requires an open proof\\." trimmed))
+                trimmed))
+          (error nil))))))
 
 (defun my-coq--last-error-string ()
   "Return best-effort plain-text error output."
@@ -619,28 +685,40 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
                              (if (fboundp 'proof-shell-strip-output-markup)
                                  (proof-shell-strip-output-markup raw)
                                raw))))
-           (shell-error (extract-error shell-text)))
-      (cond
-       ((and shell-error (> (length shell-error) 0))
-        shell-error)
-       ((buffer-live-p proof-response-buffer)
-        (with-current-buffer proof-response-buffer
-          (let ((response-text
-                 (string-trim
-                  (buffer-substring-no-properties (point-min) (point-max)))))
-            (or (extract-error response-text)
-                (and (> (length response-text) 0) response-text)))))
-       ((get-buffer "*compile-deps-dune*")
-        (with-current-buffer "*compile-deps-dune*"
-          (let ((dune-text
-                 (string-trim
-                  (buffer-substring-no-properties (point-min) (point-max)))))
-            (or (extract-error dune-text)
-                (and (> (length dune-text) 0) dune-text)))))
-       ((and shell-text (> (length shell-text) 0))
-        shell-text)
-       (t
-        "Unknown Coq error")))))
+           (shell-error (extract-error shell-text))
+           (response-text
+            (when (buffer-live-p proof-response-buffer)
+              (with-current-buffer proof-response-buffer
+                (string-trim
+                 (buffer-substring-no-properties (point-min) (point-max))))))
+           (response-error
+            (and response-text
+                 (or (extract-error response-text)
+                     (and (> (length response-text) 0) response-text))))
+           (shell-buffer-text
+            (when (buffer-live-p proof-shell-buffer)
+              (with-current-buffer proof-shell-buffer
+                (string-trim
+                 (buffer-substring-no-properties (point-min) (point-max))))))
+           (shell-buffer-error
+            (and shell-buffer-text
+                 (or (extract-error shell-buffer-text)
+                     (and (> (length shell-buffer-text) 0) shell-buffer-text))))
+           (dune-text
+            (when (get-buffer "*compile-deps-dune*")
+              (with-current-buffer "*compile-deps-dune*"
+                (string-trim
+                 (buffer-substring-no-properties (point-min) (point-max))))))
+           (dune-error
+            (and dune-text
+                 (or (extract-error dune-text)
+                     (and (> (length dune-text) 0) dune-text)))))
+      (or (and shell-error (> (length shell-error) 0) shell-error)
+          response-error
+          shell-buffer-error
+          dune-error
+          (and shell-text (> (length shell-text) 0) shell-text)
+          "Unknown Coq error"))))
 
 (defun my-coq--coq-active-buffer-p (buf)
   "Return non-nil if BUF is the currently active Rocq scripting buffer."
@@ -698,27 +776,33 @@ the nearest command boundary at or before TARGET-POINT, so success is
                        (< target-point initial-locked-end))
                   (<= locked-end target-point)
                 (>= locked-end target-point))))
-         (error-text (my-coq--last-error-string)))
+         (error-text (or (my-coq--last-error-string) "Unknown Coq error"))
+         (goal-text (my-coq--goals-string)))
     (cond
      ((eq proof-shell-last-output-kind 'interrupt)
       (my-coq--interrupted-result locked-end target-point))
      ((or forced-error
           (eq proof-shell-last-output-kind 'error)
           (not target-reached))
-      (list :ok nil
-            :error (if (or forced-error
-                           (eq proof-shell-last-output-kind 'error)
-                           (not (string= error-text "Unknown Coq error")))
-                       error-text
-                     (format "Coq stopped before target (%d < %d)"
-                             locked-end target-point))
-            :locked-end locked-end
-            :target target-point))
+      (append
+       (list :ok nil
+             :error (if (or forced-error
+                            (eq proof-shell-last-output-kind 'error)
+                            (not (string= error-text "Unknown Coq error")))
+                        error-text
+                      (format "Coq stopped before target (%d < %d)"
+                              locked-end target-point))
+             :locked-end locked-end
+             :target target-point)
+       (when goal-text
+         (list :goal goal-text))))
      (t
-      (list :ok t
-            :goal (my-coq--goals-string)
-            :locked-end locked-end
-            :target target-point)))))
+      (append
+       (list :ok t
+             :locked-end locked-end
+             :target target-point)
+       (when goal-text
+         (list :goal goal-text)))))))
 
 (defun my-coq--response-string ()
   "Return plain-text contents of `proof-response-buffer'."
@@ -775,23 +859,19 @@ the nearest command boundary at or before TARGET-POINT, so success is
               (let ((proof-query-file-save-when-activating-scripting nil)
                     (proof-auto-action-when-deactivating-scripting 'retract)
                     (restart-result nil)
+                    (preserved-session nil)
                     (initial-locked-end nil))
                 (rocqagent--claim-process-thread)
                 (rocqagent--maybe-handle-cancel buf)
                 (when (and (boundp 'proof-shell-busy) proof-shell-busy
                            (fboundp 'proof-shell-wait))
                   (my-coq--wait-for-proof-shell-with-ui buf))
-                ;; Sync script buffer text to disk first in both paths.
-                (coq-partial-revert-buffer)
-                (setq target-point
-                      (my-coq--target-point-from-line-column
-                       linenum columnnum))
-                (setq rocqagent--active-target target-point)
-                (setq initial-locked-end
-                      (if (fboundp 'proof-unprocessed-begin)
-                          (proof-unprocessed-begin)
-                        (point-min)))
                 (when reuse
+                  (coq-partial-revert-buffer)
+                  (setq target-point
+                        (my-coq--target-point-from-line-column
+                         linenum columnnum))
+                  (setq rocqagent--active-target target-point)
                   (rocqagent--recover-after-interrupt-if-needed buf)
                   (setq initial-locked-end
                         (if (fboundp 'proof-unprocessed-begin)
@@ -805,13 +885,36 @@ the nearest command boundary at or before TARGET-POINT, so success is
                   (progn
                     (unless (find-root file)
                       (error "Could not find dune-workspace above %s" file))
-                    (my-coq--goto-safe-processing-point target-point)
                     (setq restart-result
-                          (reload-to-current-point_aux file buf nil))
-                    (when (and (plist-get restart-result :ok)
-                               (boundp 'proof-shell-busy) proof-shell-busy
-                               (fboundp 'proof-shell-wait))
-                      (my-coq--wait-for-proof-shell-with-ui buf))))
+                          (reload-to-current-point_aux
+                           file buf linenum columnnum nil))
+                    (setq preserved-session
+                          (plist-get restart-result :preserved-session))
+                    (if preserved-session
+                        (with-current-buffer buf
+                          (rocqagent--recover-after-interrupt-if-needed buf)
+                          (coq-partial-revert-buffer)
+                          (setq target-point
+                                (my-coq--target-point-from-line-column
+                                 linenum columnnum))
+                          (setq rocqagent--active-target target-point)
+                          (setq initial-locked-end
+                                (if (fboundp 'proof-unprocessed-begin)
+                                    (proof-unprocessed-begin)
+                                  (point-min)))
+                          (unless (= target-point (proof-unprocessed-begin))
+                            (my-coq--goto-safe-processing-point target-point)
+                            (proof-goto-point)
+                            (my-coq--wait-for-proof-shell-with-ui buf)))
+                      (setq target-point
+                            (or (plist-get restart-result :target)
+                                (my-coq--target-point-from-line-column
+                                 linenum columnnum)))
+                      (setq rocqagent--active-target target-point)
+                      (when (and (plist-get restart-result :ok)
+                                 (boundp 'proof-shell-busy) proof-shell-busy
+                                 (fboundp 'proof-shell-wait))
+                        (my-coq--wait-for-proof-shell-with-ui buf)))))
                 (when (plist-get (or restart-result '(:ok t)) :ok)
                   (setq rocqagent--needs-recovery-after-interrupt nil)
                   (rocqagent--clear-shell-result-state))
@@ -850,11 +953,12 @@ Arguments:
 - RESTART: when non-nil, force full restart path.
 
 Return shape:
-- success: (:ok t :goal STRING :locked-end INT :target INT)
-- failure: (:ok nil :error STRING :locked-end INT :target INT)
+- success: (:ok t :locked-end INT :target INT [:goal STRING])
+- failure: (:ok nil :error STRING :locked-end INT :target INT [:goal STRING])
 
 If processing fails at or before the requested point, this returns
-an error plist instead of a goal plist."
+an error plist instead of a success plist.  `:goal' is included only
+when a proof is currently active and a fresh goal is available."
   (interactive "fFile: \nnLine (1-based): \nnColumn (0-based): \nP")
   (let* ((file (expand-file-name filename))
          (buf (or (get-file-buffer file) (find-file-noselect file)))
