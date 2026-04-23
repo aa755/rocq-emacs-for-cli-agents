@@ -31,15 +31,17 @@ Arguments:
 - `restart`: non-`nil` forces restart and builds dependencies of current file using `dune coq top`; `nil` reuses the active scripting session when possible
 
 Return value:
-- success: `(:ok t :goal STRING :locked-end INT :target INT)`
-- failure: `(:ok nil :error STRING :locked-end INT :target INT)`
+- success: `(:ok t :locked-end INT :target INT [:goal STRING])`
+- failure: `(:ok nil :error STRING :locked-end INT :target INT [:goal STRING])`
 
 Semantics:
 - If processing fails at or before the requested point, the function returns `:ok nil` with the Coq error.
 - If `linenum` and `columnnum` are both `nil`, the target is the end of the file.
 - With `restart=nil`, the function reloads the current buffer from disk incrementally before checking: the "checked-region" only reverts till the first character that was changed.
-- With `restart=t`, the file must live under a Dune workspace.
-- At end of file there is usually no open proof, so `:goal` may contain the `Show.` error text rather than a useful goal state.
+- With `restart=t`, the file must live under a Dune workspace. Frivolous `restart=t` requests may not be honored when no dependency actually changed and the existing live session can be reused safely.
+- `:goal` is included only when a proof is currently active and a fresh goal is available.
+- On proof errors, `:goal` reports the post-error current goal when Proof General still has an active proof.
+- Outside an active proof, `:goal` is omitted rather than returning stale goals or `Show.` errors.
 
 ## `coqquery_at_curpoint`
 
@@ -246,6 +248,7 @@ cat "$status_file"
 - Use `restart=t` iff some other `.v` dependency of the current file changed since the last successful check.
   Current-file edits do not justify `restart=t`: `coqcheck_until(..., restart=nil)` already does an incremental reload of the current buffer/file before checking.
   In particular, shell-editing the current file is still a `restart=nil` case.
+- If no dependency actually changed, a frivolous `restart=t` request may be treated as a normal incremental reuse of the existing live session rather than a destructive restart.
 - IN ALL CAPS: `restart=t` IS A ONE-SHOT RECOVERY FOR DEPENDENCY CHANGES, NOT A
   MODE YOU STAY IN.
 - AFTER YOU HAVE SUCCESSFULLY DONE THE DEPENDENCY-REFRESHING CHECK WITH

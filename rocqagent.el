@@ -47,7 +47,7 @@
 (defvar rocqagent--active-subphase nil
   "Current finer-grained phase for the active operation, or nil.")
 
-(defvar rocqagent-preserve-session-on-noop-restart t
+(defvar rocqagent-preserve-session-on-noop-restart nil
   "When non-nil, preserve a live Coq session on a no-op `restart=t` request.
 
 The fast path applies only when `dune rocq top' exits successfully without
@@ -483,16 +483,42 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
                (forward-line 1))
              found)))))
 
-(defun reload-to-current-point_aux (vfilename vfilebuf linenum columnnum _syncCIDuneCacheFirst)
+(defun reload-to-current-point_aux (vfilename vfilebuf &rest args)
   "Run `dune rocq top' for VFILENAME before checking VFILEBUF.
 
 When Dune succeeds without compiling any Rocq source file and VFILEBUF already
 has a live scripting session, preserve that session and let the caller follow
 the normal incremental reload path.  Otherwise, sync VFILEBUF from disk,
 restart the scripting session, and process to the target described by LINENUM
-and COLUMNNUM."
+and COLUMNNUM.
+
+This helper accepts both call shapes:
+
+- legacy interactive path: `(reload-to-current-point_aux FILE BUF)`
+- internal API path: `(reload-to-current-point_aux FILE BUF LINE COLUMN)`"
   (interactive)
-  (let* ((dune-buffer (get-buffer-create "*compile-deps-dune*"))
+  (let* ((legacy-call-p nil)
+         (linenum nil)
+         (columnnum nil))
+    (pcase args
+      (`()
+       (setq legacy-call-p t))
+      (`(,line ,column)
+       (setq linenum line
+             columnnum column))
+      (_
+       (error "reload-to-current-point_aux expects 2 or 4 arguments, got %d"
+              (+ 2 (length args)))))
+    (when legacy-call-p
+      (with-current-buffer vfilebuf
+        (let ((target-point (if (= (point) (point-min))
+                                (point-max)
+                              (point))))
+          (save-excursion
+            (goto-char target-point)
+            (setq linenum (line-number-at-pos))
+            (setq columnnum (current-column))))))
+    (let* ((dune-buffer (get-buffer-create "*compile-deps-dune*"))
          (proot (find-root (buffer-file-name)))
          (had-live-session (my-coq--coq-active-buffer-p vfilebuf))
          (retcode nil)
@@ -551,7 +577,7 @@ and COLUMNNUM."
                 :retcode retcode
                 :source 'dune-top
                 :compiled-v compiled-v
-                :target target-point)))))))
+                :target target-point))))))))
 
 (defun my-coq--none-like-p (x)
   "Return non-nil when X means \"no value\" for API callers."
@@ -896,7 +922,7 @@ the nearest command boundary at or before TARGET-POINT, so success is
                       (error "Could not find dune-workspace above %s" file))
                     (setq restart-result
                           (reload-to-current-point_aux
-                           file buf linenum columnnum nil))
+                           file buf linenum columnnum))
                     (setq preserved-session
                           (plist-get restart-result :preserved-session))
                     (if preserved-session

@@ -32,6 +32,11 @@ The supported `ELISP` payloads for `rocqagent-call` are:
 - `'(coqquery_at_curpoint QUERY FILENAME)'`
 - `'(save-file FILENAME)'`
 
+`coqcheck_until` returns `:goal` only when a proof is currently active.
+On proof errors it includes both `:error` and the fresh current `:goal` when
+available. Outside an active proof it omits `:goal` rather than returning stale
+goal text or a `Show.` error.
+
 `./rocqagent-cleanup SERVER` is the server-specific cleanup path on Linux. It:
 
 - touches the current cancel-file when a request is busy
@@ -77,6 +82,30 @@ For agent automation, prefer `./rocqagent-call SERVER ELISP` over raw
 - refuses to treat a stale `:busy t` status from a dead server as a live busy request
 
 See [AGENTS.md](AGENTS.md) for the full API contract.
+
+## Experimental features
+
+Large proof developments sometimes keep an expensive live Coq session near the
+interesting frontier, while an agent still issues `restart=t` out of caution.
+If Dune reports that nothing needed recompilation, tearing down that live
+session is wasted work: the checked region jumps back and the next proof query
+becomes slower for no benefit.
+
+To experiment with avoiding that, `rocqagent.el` exposes:
+
+```elisp
+rocqagent-preserve-session-on-noop-restart
+```
+
+When this flag is non-`nil`, a `restart=t` request that runs `dune rocq top`
+successfully but compiles no Rocq source files will keep the existing live
+session and continue with the normal incremental reload path instead of forcing
+a teardown/restart.
+
+The default is `nil`. This keeps the public API conservative. Local setups can
+opt in, for example from `~/.emacs`, if preserving an already-good live session
+after frivolous `restart=t` requests is more valuable than strict restart
+semantics.
 
 ## Setup
 
