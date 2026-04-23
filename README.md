@@ -38,6 +38,11 @@ The supported `ELISP` payloads for `rocqagent-call` are:
 On proof errors it includes both `:error` and the fresh current `:goal` when
 available. Outside an active proof it omits `:goal` rather than returning stale
 goal text or a `Show.` error.
+Before any revert/restart work, `coqcheck_until` also runs functions from
+`rocqagent-before-refresh-check-functions` on the on-disk file contents in a
+temporary `coq-mode` buffer. A validator returns `nil` to allow checking or a
+string to reject the request; validation failures come back as
+`(:ok nil :error ... :source validator)`.
 
 `./rocqagent-cleanup SERVER` is the server-specific cleanup path on Linux. It:
 
@@ -115,6 +120,21 @@ Load `rocqagent.el` after Proof General:
 
 ```elisp
 (load "/path/to/rocqagent.el")
+```
+
+Optional validation hook in `~/.emacs`:
+
+```elisp
+(defun my-rocq-validator (_filename _ctx)
+  (save-excursion
+    (goto-char (point-min))
+    (unless (re-search-forward
+             "^Set Default Goal Selector \"!\"\\.[[:space:]]*$"
+             nil t)
+      "Missing required line: Set Default Goal Selector \"!\".")))
+
+(add-hook 'rocqagent-before-refresh-check-functions
+          #'my-rocq-validator)
 ```
 
 Rocq Project Requirements:

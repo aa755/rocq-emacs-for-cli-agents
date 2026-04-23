@@ -58,6 +58,16 @@ nil restores the older behavior that always tears down the live session during
 (defvar-local rocqagent--needs-recovery-after-interrupt nil
   "Non-nil when the current Rocq buffer should repair state after an interrupt.")
 
+(defvar rocqagent-before-refresh-check-functions nil
+  "Functions run before `coqcheck_until' mutates proof state.
+
+Each function is called in a temporary `coq-mode' buffer containing the
+on-disk contents of the target file.  The function receives two arguments:
+FILENAME and CTX, where CTX is a plist containing `:restart', `:linenum', and
+`:columnnum'.  Return nil to allow checking to proceed.  Return a string to
+reject the request with that message.  Signaled errors are also reported as
+validation failures.")
+
 (defun rocqagent--control-dir ()
   "Return the directory that stores rocqagent control files."
   (let ((dir (expand-file-name "rocqagent" temporary-file-directory)))
@@ -455,6 +465,51 @@ When HARD is non-nil, escalate to killing the tracked subprocess or shell."
         (string-trim
          (buffer-substring-no-properties (point-min) (point-max))))
     ""))
+
+(defun rocqagent--prepare-validation-buffer (file)
+  "Create a temporary `coq-mode' buffer loaded from FILE."
+  (let ((buf (generate-new-buffer
+              (format " *rocqagent-validate:%s*"
+                      (file-name-nondirectory file)))))
+    (with-current-buffer buf
+      (setq buffer-file-name file)
+      (setq default-directory (file-name-directory file))
+      (insert-file-contents file)
+      (delay-mode-hooks
+        (coq-mode))
+      (set-buffer-modified-p nil))
+    buf))
+
+(defun rocqagent--run-before-refresh-checks (file linenum columnnum restart)
+  "Run pre-refresh validators for FILE.
+Return nil when validation passes, or an error plist when it fails."
+  (let ((ctx (list :restart (and restart t)
+                   :linenum linenum
+                   :columnnum columnnum)))
+    (catch 'rocqagent-validation-failed
+      (dolist (fn rocqagent-before-refresh-check-functions)
+        (let ((buf nil))
+          (unwind-protect
+              (progn
+                (setq buf (rocqagent--prepare-validation-buffer file))
+                (with-current-buffer buf
+                  (let ((result
+                         (condition-case err
+                             (funcall fn file ctx)
+                           (error
+                            (format "Validator %S failed: %s"
+                                    fn
+                                    (error-message-string err))))))
+                    (when result
+                      (throw 'rocqagent-validation-failed
+                             (list :ok nil
+                                   :error (if (stringp result)
+                                              result
+                                            (format "%s" result))
+                                   :source 'validator))))))
+            (when (buffer-live-p buf)
+              (kill-buffer buf)))))
+      nil)))
 
 (defun rocqagent--dune-compiled-v-p (buf)
   "Return non-nil when BUF shows Dune compiled at least one Rocq source file."
@@ -877,103 +932,108 @@ the nearest command boundary at or before TARGET-POINT, so success is
 (defun rocqagent--coqcheck-until-body (filename linenum columnnum restart)
   "Internal implementation shared by sync and async Coq checks."
   (let* ((file (expand-file-name filename))
-         (existing (get-file-buffer file))
-         (buf (or existing (find-file-noselect file)))
          (target-point nil))
     (condition-case err
         (my-coq--without-file-change-prompts
-          (let ((reuse (and (not restart)
-                            existing
-                            (my-coq--coq-active-buffer-p existing))))
-            (unless (file-readable-p file)
-              (error "File is not readable: %s" file))
-            (with-current-buffer buf
-              (unless (eq major-mode 'coq-mode)
-                (coq-mode))
-              ;; Avoid interactive PG prompts in non-interactive API calls.
-              (let ((proof-query-file-save-when-activating-scripting nil)
-                    (proof-auto-action-when-deactivating-scripting 'retract)
-                    (restart-result nil)
-                    (preserved-session nil)
-                    (initial-locked-end nil))
-                (rocqagent--claim-process-thread)
-                (rocqagent--maybe-handle-cancel buf)
-                (when (and (boundp 'proof-shell-busy) proof-shell-busy
-                           (fboundp 'proof-shell-wait))
-                  (my-coq--wait-for-proof-shell-with-ui buf))
-                (when reuse
-                  (coq-partial-revert-buffer)
-                  (setq target-point
-                        (my-coq--target-point-from-line-column
-                         linenum columnnum))
-                  (setq rocqagent--active-target target-point)
-                  (rocqagent--recover-after-interrupt-if-needed buf)
-                  (setq initial-locked-end
-                        (if (fboundp 'proof-unprocessed-begin)
-                            (proof-unprocessed-begin)
-                          (point-min))))
-                (if reuse
-                    (unless (= target-point (proof-unprocessed-begin))
-                      (my-coq--goto-safe-processing-point target-point)
-                      (proof-goto-point)
-                      (my-coq--wait-for-proof-shell-with-ui buf))
-                  (progn
-                    (unless (find-root file)
-                      (error "Could not find dune-workspace above %s" file))
-                    (setq restart-result
-                          (reload-to-current-point_aux
-                           file buf linenum columnnum))
-                    (setq preserved-session
-                          (plist-get restart-result :preserved-session))
-                    (if preserved-session
-                        (with-current-buffer buf
-                          (rocqagent--recover-after-interrupt-if-needed buf)
-                          (coq-partial-revert-buffer)
-                          (setq target-point
-                                (my-coq--target-point-from-line-column
-                                 linenum columnnum))
-                          (setq rocqagent--active-target target-point)
-                          (setq initial-locked-end
-                                (if (fboundp 'proof-unprocessed-begin)
-                                    (proof-unprocessed-begin)
-                                  (point-min)))
-                          (unless (= target-point (proof-unprocessed-begin))
-                            (my-coq--goto-safe-processing-point target-point)
-                            (proof-goto-point)
-                            (my-coq--wait-for-proof-shell-with-ui buf)))
-                      (setq target-point
-                            (or (plist-get restart-result :target)
-                                (my-coq--target-point-from-line-column
-                                 linenum columnnum)))
-                      (setq rocqagent--active-target target-point)
-                      (when (and (plist-get restart-result :ok)
-                                 (boundp 'proof-shell-busy) proof-shell-busy
-                                 (fboundp 'proof-shell-wait))
-                        (my-coq--wait-for-proof-shell-with-ui buf)))))
-                (when (plist-get (or restart-result '(:ok t)) :ok)
-                  (setq rocqagent--needs-recovery-after-interrupt nil)
-                  (rocqagent--clear-shell-result-state))
-                (if (and restart-result
-                         (not (plist-get restart-result :ok)))
-                    (append
-                     restart-result
-                     (list :locked-end (if (fboundp 'proof-unprocessed-begin)
-                                           (proof-unprocessed-begin)
-                                         (point-min))
-                           :target target-point))
-                  (my-coq--result-at-target
-                   target-point
-                   (and (not reuse)
-                        (not (my-coq--coq-active-buffer-p buf)))
-                   initial-locked-end))))))
-      (rocqagent-interrupted
-       (rocqagent--note-interrupted-buffer buf)
-       (my-coq--interrupted-result
-        (and (buffer-live-p buf)
+          (unless (file-readable-p file)
+            (error "File is not readable: %s" file))
+          (or
+           (rocqagent--run-before-refresh-checks
+            file linenum columnnum restart)
+           (let* ((existing (get-file-buffer file))
+                  (buf (or existing (find-file-noselect file)))
+                  (reuse (and (not restart)
+                              existing
+                              (my-coq--coq-active-buffer-p existing))))
              (with-current-buffer buf
-               (if (fboundp 'proof-unprocessed-begin)
-                   (proof-unprocessed-begin)
-                 (point-min))))
+               (unless (eq major-mode 'coq-mode)
+                 (coq-mode))
+               ;; Avoid interactive PG prompts in non-interactive API calls.
+               (let ((proof-query-file-save-when-activating-scripting nil)
+                     (proof-auto-action-when-deactivating-scripting 'retract)
+                     (restart-result nil)
+                     (preserved-session nil)
+                     (initial-locked-end nil))
+                 (rocqagent--claim-process-thread)
+                 (rocqagent--maybe-handle-cancel buf)
+                 (when (and (boundp 'proof-shell-busy) proof-shell-busy
+                            (fboundp 'proof-shell-wait))
+                   (my-coq--wait-for-proof-shell-with-ui buf))
+                 (when reuse
+                   (coq-partial-revert-buffer)
+                   (setq target-point
+                         (my-coq--target-point-from-line-column
+                          linenum columnnum))
+                   (setq rocqagent--active-target target-point)
+                   (rocqagent--recover-after-interrupt-if-needed buf)
+                   (setq initial-locked-end
+                         (if (fboundp 'proof-unprocessed-begin)
+                             (proof-unprocessed-begin)
+                           (point-min))))
+                 (if reuse
+                     (unless (= target-point (proof-unprocessed-begin))
+                       (my-coq--goto-safe-processing-point target-point)
+                       (proof-goto-point)
+                       (my-coq--wait-for-proof-shell-with-ui buf))
+                   (progn
+                     (unless (find-root file)
+                       (error "Could not find dune-workspace above %s" file))
+                     (setq restart-result
+                           (reload-to-current-point_aux
+                            file buf linenum columnnum))
+                     (setq preserved-session
+                           (plist-get restart-result :preserved-session))
+                     (if preserved-session
+                         (with-current-buffer buf
+                           (rocqagent--recover-after-interrupt-if-needed buf)
+                           (coq-partial-revert-buffer)
+                           (setq target-point
+                                 (my-coq--target-point-from-line-column
+                                  linenum columnnum))
+                           (setq rocqagent--active-target target-point)
+                           (setq initial-locked-end
+                                 (if (fboundp 'proof-unprocessed-begin)
+                                     (proof-unprocessed-begin)
+                                   (point-min)))
+                           (unless (= target-point (proof-unprocessed-begin))
+                             (my-coq--goto-safe-processing-point target-point)
+                             (proof-goto-point)
+                             (my-coq--wait-for-proof-shell-with-ui buf)))
+                       (setq target-point
+                             (or (plist-get restart-result :target)
+                                 (my-coq--target-point-from-line-column
+                                  linenum columnnum)))
+                       (setq rocqagent--active-target target-point)
+                       (when (and (plist-get restart-result :ok)
+                                  (boundp 'proof-shell-busy) proof-shell-busy
+                                  (fboundp 'proof-shell-wait))
+                         (my-coq--wait-for-proof-shell-with-ui buf)))))
+                 (when (plist-get (or restart-result '(:ok t)) :ok)
+                   (setq rocqagent--needs-recovery-after-interrupt nil)
+                   (rocqagent--clear-shell-result-state))
+                 (if (and restart-result
+                          (not (plist-get restart-result :ok)))
+                     (append
+                      restart-result
+                      (list :locked-end (if (fboundp 'proof-unprocessed-begin)
+                                            (proof-unprocessed-begin)
+                                          (point-min))
+                            :target target-point))
+                   (my-coq--result-at-target
+                    target-point
+                    (and (not reuse)
+                         (not (my-coq--coq-active-buffer-p buf)))
+                    initial-locked-end)))))))
+      (rocqagent-interrupted
+       (let ((buf (get-file-buffer file)))
+         (rocqagent--note-interrupted-buffer buf))
+       (my-coq--interrupted-result
+        (let ((buf (get-file-buffer file)))
+          (and (buffer-live-p buf)
+               (with-current-buffer buf
+                 (if (fboundp 'proof-unprocessed-begin)
+                     (proof-unprocessed-begin)
+                   (point-min)))))
         target-point))
       (error
        (list :ok nil :error (error-message-string err))))))
