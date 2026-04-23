@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Shell-side health check for rocqagent Emacs servers.
+
+This reads the shell-visible status file, checks the recorded Emacs PID and
+socket path, and finally performs a short `emacsclient` ping so callers can
+distinguish:
+
+- live server with responsive RPC
+- stale status for a dead PID/socket
+- live socket whose RPC path is wedged
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+def server_tag(server: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", server)
+
+
+def default_server() -> str:
+    return os.environ.get("EMACS_SOCKET_NAME", "default")
+
+
+def control_dir() -> Path:
+    return Path(os.environ.get("TMPDIR", "/tmp")) / "rocqagent"
+
+
+def default_socket_dir() -> Path:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return Path(xdg) / "emacs"
+    return Path(f"/run/user/{os.getuid()}/emacs")
+
+
+def default_socket_path(server: str) -> Path:
+    return default_socket_dir() / server
+
+
+def socket_name_for(server: str) -> str:
+    return "server" if server == "default" else server
+
+
+def parse_string(text: str, key: str) -> str | None:
+    m = re.search(rf":{re.escape(key)}\s+\"((?:\\.|[^\"\\])*)\"", text, re.S)
+    if not m:
+        return None
+    return ast.literal_eval(f'"{m.group(1)}"')
+
+
+def parse_symbol(text: str, key: str) -> str | None:
+    m = re.search(rf":{re.escape(key)}\s+([^\s()]+)", text)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def parse_int(text: str, key: str) -> int | None:
+    m = re.search(rf":{re.escape(key)}\s+(-?\d+)", text)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def parse_float(text: str, key: str) -> float | None:
+    m = re.search(rf":{re.escape(key)}\s+(-?(?:\d+(?:\.\d*)?|\.\d+))", text)
+    if not m:
+        return None
+    return float(m.group(1))
+
+
+def parse_bool(text: str, key: str) -> bool | None:
+    m = re.search(rf":{re.escape(key)}\s+(t|nil)\b", text)
+    if not m:
+        return None
+    return m.group(1) == "t"
+
+
+@dataclass
+class StatusSnapshot:
+    exists: bool
+    raw: str | None
+    data: dict[str, Any]
+
+
+def read_status_file(path: Path) -> StatusSnapshot:
+    if not path.exists():
+        return StatusSnapshot(False, None, {})
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    data = {
+        "busy": parse_bool(raw, "busy"),
+        "phase": parse_symbol(raw, "phase"),
+        "kind": parse_symbol(raw, "kind"),
+        "id": parse_int(raw, "id"),
+        "cancel_file": parse_string(raw, "cancel-file"),
+        "server": parse_string(raw, "server"),
+        "server_name": parse_string(raw, "server-name"),
+        "file": parse_string(raw, "file"),
+        "updated_at": parse_float(raw, "updated-at"),
+        "emacs_pid": parse_int(raw, "emacs-pid"),
+        "emacs_comm": parse_string(raw, "emacs-comm"),
+        "emacs_startticks": parse_int(raw, "emacs-startticks"),
+        "proof_pid": parse_int(raw, "proof-pid"),
+        "proof_comm": parse_string(raw, "proof-comm"),
+        "proof_startticks": parse_int(raw, "proof-startticks"),
+        "active_pid": parse_int(raw, "active-pid"),
+        "active_comm": parse_string(raw, "active-comm"),
+        "active_startticks": parse_int(raw, "active-startticks"),
+        "socket_dir": parse_string(raw, "socket-dir"),
+        "socket_path": parse_string(raw, "socket-path"),
+    }
+    return StatusSnapshot(True, raw, data)
+
+
+def pid_live(pid: int | None) -> bool | None:
+    if pid is None:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    else:
+        return True
+
+
+def socket_live(path: Path | None) -> bool | None:
+    if path is None:
+        return None
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return stat.S_ISSOCK(st.st_mode)
+
+
+def ping_emacs(server: str, timeout_s: float) -> dict[str, Any]:
+    cmd = ["emacsclient", "-s", server, "-e", "t"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "rpc_state": "timeout",
+            "rpc_ok": False,
+            "rpc_exit_code": None,
+            "rpc_stdout": "",
+            "rpc_stderr": "",
+        }
+    return {
+        "rpc_state": "ok" if proc.returncode == 0 else "error",
+        "rpc_ok": proc.returncode == 0,
+        "rpc_exit_code": proc.returncode,
+        "rpc_stdout": proc.stdout.strip(),
+        "rpc_stderr": proc.stderr.strip(),
+    }
+
+
+def rpc_dead_socket(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return (
+        "connection refused" in lowered
+        or "can't find socket" in lowered
+        or "error accessing socket" in lowered
+        or "no such file or directory" in lowered
+    )
+
+
+def classify_health(
+    status_exists: bool,
+    busy: bool | None,
+    pid_is_live: bool | None,
+    socket_is_live: bool | None,
+    rpc_state: str,
+    rpc_stderr: str,
+) -> str:
+    if not status_exists:
+        if rpc_state == "ok":
+            return "live_no_status"
+        if rpc_state == "skipped":
+            return "no_status_no_ping"
+        if socket_is_live is False or (rpc_state == "error" and rpc_dead_socket(rpc_stderr)):
+            return "no_status_dead_socket"
+        return "no_status"
+    if pid_is_live is False:
+        return "stale_dead_pid_busy" if busy else "stale_dead_pid_idle"
+    if socket_is_live is False or (rpc_state == "error" and rpc_dead_socket(rpc_stderr)):
+        return "stale_dead_socket_busy" if busy else "stale_dead_socket_idle"
+    if rpc_state == "skipped":
+        return "busy_no_ping" if busy else "idle_no_ping"
+    if rpc_state == "ok":
+        return "busy_live" if busy else "idle_live"
+    if rpc_state == "timeout":
+        return "busy_rpc_unresponsive" if busy else "idle_rpc_unresponsive"
+    return "busy_rpc_error" if busy else "idle_rpc_error"
+
+
+def exit_code_for(health: str) -> int:
+    if health in {
+        "busy_live",
+        "idle_live",
+        "live_no_status",
+        "busy_no_ping",
+        "idle_no_ping",
+    }:
+        return 0
+    return 1
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("server", nargs="?", default=default_server())
+    parser.add_argument("--ping-timeout", type=float, default=1.5)
+    parser.add_argument("--skip-ping", action="store_true")
+    args = parser.parse_args(argv)
+
+    tag = server_tag(args.server)
+    status_path = control_dir() / f"{tag}.status"
+    snapshot = read_status_file(status_path)
+
+    status_server = snapshot.data.get("server") or args.server
+    socket_name = snapshot.data.get("server_name") or socket_name_for(status_server)
+    socket_path_str = snapshot.data.get("socket_path")
+    socket_path = Path(socket_path_str) if socket_path_str else default_socket_path(socket_name)
+    pid = snapshot.data.get("emacs_pid")
+    pid_is_live = pid_live(pid)
+    socket_is_live = socket_live(socket_path)
+
+    if args.skip_ping:
+        rpc = {
+            "rpc_state": "skipped",
+            "rpc_ok": None,
+            "rpc_exit_code": None,
+            "rpc_stdout": "",
+            "rpc_stderr": "",
+        }
+    else:
+        rpc = ping_emacs(socket_name, args.ping_timeout)
+
+    health = classify_health(
+        snapshot.exists,
+        snapshot.data.get("busy"),
+        pid_is_live,
+        socket_is_live,
+        rpc["rpc_state"],
+        rpc["rpc_stderr"],
+    )
+
+    result = {
+        "ok": True,
+        "server": status_server,
+        "server_name": socket_name,
+        "server_tag": tag,
+        "status_file": str(status_path),
+        "status_file_exists": snapshot.exists,
+        "busy": snapshot.data.get("busy"),
+        "phase": snapshot.data.get("phase"),
+        "kind": snapshot.data.get("kind"),
+        "id": snapshot.data.get("id"),
+        "cancel_file": snapshot.data.get("cancel_file"),
+        "file": snapshot.data.get("file"),
+        "updated_at": snapshot.data.get("updated_at"),
+        "emacs_pid": pid,
+        "emacs_comm": snapshot.data.get("emacs_comm"),
+        "emacs_startticks": snapshot.data.get("emacs_startticks"),
+        "proof_pid": snapshot.data.get("proof_pid"),
+        "proof_comm": snapshot.data.get("proof_comm"),
+        "proof_startticks": snapshot.data.get("proof_startticks"),
+        "active_pid": snapshot.data.get("active_pid"),
+        "active_comm": snapshot.data.get("active_comm"),
+        "active_startticks": snapshot.data.get("active_startticks"),
+        "pid_live": pid_is_live,
+        "socket_path": str(socket_path),
+        "socket_exists": socket_is_live,
+        "rpc_state": rpc["rpc_state"],
+        "rpc_ok": rpc["rpc_ok"],
+        "rpc_exit_code": rpc["rpc_exit_code"],
+        "rpc_stdout": rpc["rpc_stdout"],
+        "rpc_stderr": rpc["rpc_stderr"],
+        "health": health,
+    }
+    json.dump(result, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return exit_code_for(health)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

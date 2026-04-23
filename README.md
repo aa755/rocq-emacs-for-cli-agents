@@ -4,6 +4,8 @@ Small Emacs/Proof-General helpers for CLI agents working on Rocq/Coq proofs.
 It can connect to an existing emacs+proof-general+company-coq session and drive proofs efficiently.
 Here is a [demo](https://asciinema.org/a/vxXdoVQI3qzmscpc)
 
+This repo also ships a Codex skill at [skills/rocqemacs/SKILL.md](skills/rocqemacs/SKILL.md).
+
 ## Comparison with other approaches
 
 Compared with inserting `Show.` (to see goals) and rebuilding with `dune`, `coqc`, or `rocq c` after every edit:
@@ -81,7 +83,7 @@ For agent automation, prefer `./rocqagent-call SERVER ELISP` over raw
   talking to the same server
 - refuses to treat a stale `:busy t` status from a dead server as a live busy request
 
-See [AGENTS.md](AGENTS.md) for the full API contract.
+See [skills/rocqemacs/SKILL.md](skills/rocqemacs/SKILL.md) for the full agent-facing API contract.
 
 ## Experimental features
 
@@ -119,4 +121,4 @@ Rocq Project Requirements:
 
 - This API uses dune to build dependencies of the current file when the agent requests a fresh build. so a dune build system is needed.
 - A _CoqProject is also needed by proof-general/company-coq to pass the right flags (e.g. -Q) to Coq. There are tools to build _CoqProject automatically from dune: e.g. see SkyLabsAI repos.
-- AGENTS.md in the project or some active skills file should ask the agent to read AGENTS.md in this repo
+- Point agents to [skills/rocqemacs/SKILL.md](skills/rocqemacs/SKILL.md)
