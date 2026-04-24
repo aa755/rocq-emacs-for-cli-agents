@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import ast
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterable
+
+
+WORKSPACE = Path(
+    os.environ.get("ROCQ_DUNE_GATE_WORKSPACE", Path(__file__).resolve().parents[2])
+).resolve()
+STATE_DIR = WORKSPACE / ".codex" / "state"
+STATE_FILE = STATE_DIR / "rocq-check-stamps.json"
+LOCK_FILE = STATE_DIR / "rocq-check-stamps.lock"
+SHELL_SEPARATORS = {";", "&&", "||", "|", "(", ")"}
+SOURCE_SUFFIXES = {".v"}
+BUILD_SUFFIXES = {".vo", ".vos", ".vok", ".glob"}
+OPTIONS_WITH_VALUE = {
+    "--root",
+    "--build-dir",
+    "--display",
+    "--profile",
+    "--workspace",
+    "--only-packages",
+    "--ignore-promoted-rules",
+    "-j",
+    "-p",
+}
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in {"pre", "post"}:
+        print("usage: rocq_dune_gate.py pre|post", file=sys.stderr)
+        return 2
+
+    payload = json.load(sys.stdin)
+    command = payload.get("tool_input", {}).get("command", "")
+    cwd = Path(payload.get("cwd") or WORKSPACE)
+
+    if sys.argv[1] == "post":
+        maybe_record_rocq_checks(command, payload.get("tool_response"))
+        return 0
+
+    missing = missing_checks_for_dune_command(command, cwd)
+    if missing:
+        print(block_message(missing), file=sys.stderr)
+        return 2
+    return 0
+
+
+def block_message(paths: list[Path]) -> str:
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        "Blocked: run rocqagent-call with coqcheck_until on each changed Coq "
+        "file before dune builds it.\n"
+        "The following files have a non-empty git diff and no fresh successful "
+        "rocqagent coqcheck stamp:\n"
+        f"{listed}\n"
+        "Example: rocqagent-call SERVER "
+        "'(coqcheck_until \"/abs/path/file.v\" nil nil nil)'"
+    )
+
+
+def maybe_record_rocq_checks(command: str, tool_response: object) -> None:
+    response_text = tool_response if isinstance(tool_response, str) else ""
+    if ":ok t" not in response_text:
+        return
+
+    files = coqcheck_files_in_command(command)
+    if not files:
+        return
+
+    with locked_state() as state:
+        stamps = state.setdefault("stamps", {})
+        for path in files:
+            if not path.is_file() or path.suffix != ".v":
+                continue
+            stat = path.stat()
+            stamps[str(path)] = {
+                "sha256": sha256_file(path),
+                "mtime_ns": stat.st_mtime_ns,
+                "checked_at_ns": time.time_ns(),
+                "command": command,
+            }
+
+
+def missing_checks_for_dune_command(command: str, cwd: Path) -> list[Path]:
+    invocations = dune_build_invocations(command, cwd)
+    if not invocations:
+        return []
+
+    with locked_state() as state:
+        stamps = state.get("stamps", {})
+        missing: list[Path] = []
+        for base_dir, targets in invocations:
+            sources = sources_for_targets(base_dir, targets)
+            if not sources:
+                sources = dirty_v_files(base_dir)
+            for source in sources:
+                if source.suffix != ".v" or not source.exists():
+                    continue
+                if not has_git_diff(source):
+                    continue
+                if not has_fresh_stamp(source, stamps):
+                    missing.append(source)
+        return sorted(set(missing))
+
+
+def has_fresh_stamp(path: Path, stamps: dict[str, object]) -> bool:
+    stamp = stamps.get(str(path))
+    if not isinstance(stamp, dict):
+        return False
+    try:
+        checked_at_ns = int(stamp["checked_at_ns"])
+        stamped_hash = str(stamp["sha256"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    stat = path.stat()
+    return checked_at_ns >= stat.st_mtime_ns and stamped_hash == sha256_file(path)
+
+
+def dune_build_invocations(command: str, cwd: Path) -> list[tuple[Path, list[str]]]:
+    tokens = shell_tokens(command)
+    invocations: list[tuple[Path, list[str]]] = []
+    i = 0
+    while i < len(tokens):
+        if Path(tokens[i]).name != "dune":
+            i += 1
+            continue
+
+        root_dir = cwd
+        j = i + 1
+        while j < len(tokens) and tokens[j] not in SHELL_SEPARATORS:
+            token = tokens[j]
+            if token == "--root" and j + 1 < len(tokens):
+                root_dir = resolve_path(cwd, tokens[j + 1])
+                j += 2
+                continue
+            if token.startswith("--root="):
+                root_dir = resolve_path(cwd, token.split("=", 1)[1])
+                j += 1
+                continue
+            if token in {"build", "b"}:
+                targets, end = parse_dune_targets(tokens, j + 1)
+                invocations.append((root_dir, targets))
+                i = end
+                break
+            if token.startswith("-") and option_takes_separate_value(token) and j + 1 < len(tokens):
+                j += 2
+            else:
+                j += 1
+        else:
+            i = j + 1
+    return invocations
+
+
+def parse_dune_targets(tokens: list[str], start: int) -> tuple[list[str], int]:
+    targets: list[str] = []
+    i = start
+    while i < len(tokens) and tokens[i] not in SHELL_SEPARATORS:
+        token = tokens[i]
+        if token == "--":
+            i += 1
+            while i < len(tokens) and tokens[i] not in SHELL_SEPARATORS:
+                targets.append(tokens[i])
+                i += 1
+            break
+        if token.startswith("-"):
+            if option_takes_separate_value(token) and "=" not in token and i + 1 < len(tokens):
+                i += 2
+            else:
+                i += 1
+            continue
+        targets.append(token)
+        i += 1
+    return targets, i
+
+
+def option_takes_separate_value(token: str) -> bool:
+    return token in OPTIONS_WITH_VALUE
+
+
+def sources_for_targets(base_dir: Path, targets: Iterable[str]) -> list[Path]:
+    sources: list[Path] = []
+    for target in targets:
+        if target.startswith("@"):
+            continue
+        if target.startswith("_build/default/"):
+            target = target.removeprefix("_build/default/")
+        path = resolve_path(base_dir, target)
+        if path.suffix in SOURCE_SUFFIXES:
+            sources.append(path)
+        elif path.suffix in BUILD_SUFFIXES:
+            sources.append(path.with_suffix(".v"))
+        elif path.is_dir():
+            sources.extend(dirty_v_files(path))
+    return sorted(set(sources))
+
+
+def dirty_v_files(base_dir: Path) -> list[Path]:
+    root = git_root(base_dir)
+    if root is None:
+        return []
+    names: set[str] = set()
+    for args in (["diff", "--name-only", "--", "*.v"], ["diff", "--cached", "--name-only", "--", "*.v"]):
+        proc = run_git(root, args)
+        if proc.returncode == 0:
+            names.update(line for line in proc.stdout.splitlines() if line)
+    return sorted(root / name for name in names)
+
+
+def has_git_diff(path: Path) -> bool:
+    root = git_root(path.parent)
+    if root is None:
+        return False
+    try:
+        rel = str(path.relative_to(root))
+    except ValueError:
+        return False
+    unstaged = run_git(root, ["diff", "--quiet", "--", rel]).returncode
+    staged = run_git(root, ["diff", "--cached", "--quiet", "--", rel]).returncode
+    return unstaged == 1 or staged == 1
+
+
+def coqcheck_files_in_command(command: str) -> list[Path]:
+    tokens = shell_tokens(command)
+    files: list[Path] = []
+    for i, token in enumerate(tokens):
+        if Path(token).name != "rocqagent-call":
+            continue
+        expr = rocqagent_expr_after(tokens, i + 1)
+        if expr is None or "coqcheck_until" not in expr:
+            continue
+        path = coqcheck_filename(expr)
+        if path is not None:
+            files.append(path)
+    return files
+
+
+def rocqagent_expr_after(tokens: list[str], start: int) -> str | None:
+    saw_server = False
+    i = start
+    while i < len(tokens) and tokens[i] not in SHELL_SEPARATORS:
+        token = tokens[i]
+        if token in {"--wait-lock", "--skip-ping"}:
+            i += 1
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        if not saw_server:
+            saw_server = True
+            i += 1
+            continue
+        return token
+    return None
+
+
+def coqcheck_filename(expr: str) -> Path | None:
+    match = re.search(r"\(\s*coqcheck_until\s+(\"(?:\\.|[^\"\\])*\")", expr)
+    if not match:
+        return None
+    try:
+        value = ast.literal_eval(match.group(1))
+    except (SyntaxError, ValueError):
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else (WORKSPACE / path).resolve()
+
+
+def shell_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return []
+
+
+def resolve_path(base_dir: Path, path: str) -> Path:
+    expanded = Path(os.path.expanduser(path))
+    if expanded.is_absolute():
+        return expanded.resolve()
+    return (base_dir / expanded).resolve()
+
+
+def git_root(path: Path) -> Path | None:
+    proc = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return Path(proc.stdout.strip()).resolve()
+
+
+def run_git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@contextmanager
+def locked_state():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = load_state()
+        yield state
+        write_state(state)
+
+
+def load_state() -> dict[str, object]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_state(state: dict[str, object]) -> None:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp.replace(STATE_FILE)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
