@@ -114,6 +114,64 @@ opt in, for example from `~/.emacs`, if preserving an already-good live session
 after frivolous `restart=t` requests is more valuable than strict restart
 semantics.
 
+### Codex Dune build gate hook
+
+The skill also includes an experimental Codex hook script:
+
+```text
+skills/rocqemacs/scripts/rocq-dune-gate
+```
+
+It blocks `dune build` / `dune b` on dirty `.v` files unless the file has had a
+successful `rocqagent-call ... coqcheck_until` since its last edit.  This is a
+guardrail against using a full Dune build as the first checker for files that
+should have been checked incrementally through the live Emacs session.
+
+Example project setup:
+
+```sh
+mkdir -p PROJECT_ROOT/.codex/hooks
+ln -s /home/abhishek/fv-workspace/rocq-emacs-for-cli-agents/skills/rocqemacs/scripts/rocq-dune-gate \
+  PROJECT_ROOT/.codex/hooks/rocq-dune-gate
+```
+
+Then add this to `PROJECT_ROOT/.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROCQ_DUNE_GATE_WORKSPACE=/absolute/path/to/PROJECT_ROOT python3 /absolute/path/to/PROJECT_ROOT/.codex/hooks/rocq-dune-gate pre",
+            "timeoutSec": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROCQ_DUNE_GATE_WORKSPACE=/absolute/path/to/PROJECT_ROOT python3 /absolute/path/to/PROJECT_ROOT/.codex/hooks/rocq-dune-gate post",
+            "timeoutSec": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Use absolute paths in `hooks.json`.  Codex runs hook commands from the tool
+invocation working directory, not from the directory containing `hooks.json`, so
+relative paths can break when the agent is working in a subdirectory.
+
 ## Setup
 
 Load `rocqagent.el` after Proof General:
