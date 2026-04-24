@@ -44,7 +44,7 @@ Semantics:
 - If `linenum` and `columnnum` are both `nil`, the target is the end of the file.
 - With `restart=nil`, the function reloads the current buffer from disk incrementally before checking: the "checked-region" only reverts till the first character that was changed.
 - With `restart=t`, the file must live under a Dune workspace. Frivolous `restart=t` requests may not be honored when no dependency actually changed and the existing live session can be reused safely.
-- Before any revert/restart work, `coqcheck_until` runs functions from `rocqagent-before-refresh-check-functions` on the on-disk file contents in a temporary `coq-mode` buffer. A validator should return `nil` to allow checking or a string to reject the request. Validator failures return `(:ok nil :error ... :source validator)`.
+- Before any proof-state mutation, `coqcheck_until` may fail early due to user-configured Emacs-side validation checks on the file contents.
 - `:goal` is included only when a proof is currently active and a fresh goal is available.
 - On proof errors, `:goal` reports the post-error current goal when Proof General still has an active proof.
 - Outside an active proof, `:goal` is omitted rather than returning stale goals or `Show.` errors.

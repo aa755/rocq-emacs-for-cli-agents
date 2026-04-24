@@ -38,7 +38,7 @@ The supported `ELISP` payloads for `rocqagent-call` are:
 On proof errors it includes both `:error` and the fresh current `:goal` when
 available. Outside an active proof it omits `:goal` rather than returning stale
 goal text or a `Show.` error.
-Before any revert/restart work, `coqcheck_until` also runs functions from
+Before any proof-state mutation, `coqcheck_until` also runs functions from
 `rocqagent-before-refresh-check-functions` on the on-disk file contents in a
 temporary `coq-mode` buffer. A validator returns `nil` to allow checking or a
 string to reject the request; validation failures come back as
@@ -79,7 +79,7 @@ This is the intended way to tell apart:
 - stale/dead socket
 - RPC path wedged even though the status file says `:busy nil`
 
-For agent automation, prefer `./rocqagent-call SERVER ELISP` over raw
+For agent automation, you must use `./rocqagent-call SERVER ELISP` instead of the raw
 `emacsclient --eval ...`. The wrapper:
 
 - enforces one shell-side RPC at a time per Emacs server
@@ -193,6 +193,35 @@ Optional validation hook in `~/.emacs`:
 
 (add-hook 'rocqagent-before-refresh-check-functions
           #'my-rocq-validator)
+```
+
+What this example does:
+
+- it enforces that every checked file contains the line `Set Default Goal Selector "!".`
+- the check runs before `coqcheck_until` starts reverting, restarting, or sending commands to Rocq
+- if the line is missing, the API returns a validator error immediately
+
+How to enable it:
+
+- add the snippet above to `~/.emacs`
+- restart the Emacs daemon, or evaluate the new definitions in the running Emacs session
+
+## Making the skill visible to Codex
+
+Project-local skill link:
+
+```sh
+mkdir -p PROJECT_ROOT/.agents/skills
+ln -s /home/abhishek/fv-workspace/rocq-emacs-for-cli-agents/skills/rocqemacs \
+  PROJECT_ROOT/.agents/skills/rocqemacs
+```
+
+Global skill link:
+
+```sh
+mkdir -p ~/.codex/skills
+ln -s /home/abhishek/fv-workspace/rocq-emacs-for-cli-agents/skills/rocqemacs \
+  ~/.codex/skills/rocqemacs
 ```
 
 Rocq Project Requirements:
