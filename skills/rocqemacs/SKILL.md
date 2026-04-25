@@ -192,6 +192,12 @@ Practical rule:
 - Run `scripts/rocqagent-health SERVER` first so you know whether the server is live, dead, or RPC-wedged.
 - Then read the status file, `touch` the cancel file when appropriate, and wait for the operation to stop.
 
+## Reporting API Problems
+
+- If the Emacs/Proof-General API misbehaves, recover the session first when possible and continue the proof task once the session is usable again.
+- Do not only report the problem in chat. File an actionable issue at https://github.com/aa755/rocq-emacs-for-cli-agents/issues.
+- Include the server name, exact `rocqagent-call` command, target file/check point, status file path and relevant contents, stdout/stderr, `rocqagent-health` output, and the recovery action taken.
+
 ## One RPC At A Time
 
 - IN ALL CAPS: SEND AT MOST ONE `emacsclient` REQUEST AT A TIME TO A GIVEN ROCQAGENT SERVER.
