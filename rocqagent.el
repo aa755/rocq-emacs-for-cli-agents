@@ -378,7 +378,8 @@ PHASE defaults to `done'. RESULT, when non-nil, is stored in the status file."
     (setq proof-shell-last-output nil))
   (when (boundp 'proof-shell-interrupt-pending)
     (setq proof-shell-interrupt-pending nil))
-  (when (buffer-live-p proof-response-buffer)
+  (when (and (boundp 'proof-response-buffer)
+             (buffer-live-p proof-response-buffer))
     (with-current-buffer proof-response-buffer
       (let ((inhibit-read-only t))
         (erase-buffer)))))
@@ -733,9 +734,11 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
         :interrupt-pending
         (and (boundp 'proof-shell-interrupt-pending)
              proof-shell-interrupt-pending)
-        :response-live (buffer-live-p proof-response-buffer)
+        :response-live (and (boundp 'proof-response-buffer)
+                            (buffer-live-p proof-response-buffer))
         :response-text
-        (when (buffer-live-p proof-response-buffer)
+        (when (and (boundp 'proof-response-buffer)
+                   (buffer-live-p proof-response-buffer))
           (with-current-buffer proof-response-buffer
             (buffer-substring-no-properties (point-min) (point-max))))))
 
@@ -751,11 +754,57 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
     (setq proof-shell-interrupt-pending
           (plist-get state :interrupt-pending)))
   (when (and (plist-get state :response-live)
+             (boundp 'proof-response-buffer)
              (buffer-live-p proof-response-buffer))
     (with-current-buffer proof-response-buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert (or (plist-get state :response-text) ""))))))
+
+(defun rocqagent--proof-shell-end ()
+  "Return the end position of the Proof General shell buffer, if available."
+  (when (and (boundp 'proof-shell-buffer)
+             (buffer-live-p proof-shell-buffer))
+    (with-current-buffer proof-shell-buffer
+      (point-max))))
+
+(defun rocqagent--infomessages-from-shell (&optional start)
+  "Return plain text from `<infomsg>' blocks in the shell after START."
+  (when (and (boundp 'proof-shell-buffer)
+             (buffer-live-p proof-shell-buffer))
+    (let ((raw (with-current-buffer proof-shell-buffer
+                 (buffer-substring-no-properties
+                  (or start (point-min))
+                  (point-max))))
+          (pos 0)
+          (messages nil))
+      (while-let ((open (string-search "<infomsg>" raw pos)))
+        (let* ((body-start (+ open (length "<infomsg>")))
+               (close (string-search "</infomsg>" raw body-start)))
+          (if close
+              (let ((plain (string-trim
+                            (substring raw body-start close))))
+                (when (and plain (> (length plain) 0))
+                  (push plain messages))
+                (setq pos (+ close (length "</infomsg>"))))
+            (setq pos (length raw)))))
+      (when messages
+        (string-join (nreverse messages) "\n")))))
+
+(defun my-coq--last-message-string (&optional shell-start)
+  "Return info messages printed by the current Rocq check, if any.
+
+This must be called before diagnostic commands such as `Show.', because those
+commands overwrite Proof General's last-output variables."
+  (cl-labels
+      ((non-error-output-p (text)
+         (and text
+              (> (length text) 0)
+              (not (string-match-p
+                    "\\`\\(Error:\\|Anomaly:\\|Exception:\\)"
+                    text)))))
+    (let ((info-text (rocqagent--infomessages-from-shell shell-start)))
+      (and (non-error-output-p info-text) info-text))))
 
 (defun my-coq--goals-string ()
   "Return plain-text goals reported by Rocq, or nil outside an active proof.
@@ -894,13 +943,15 @@ this diagnostic query cannot change the enclosing check result."
        (current-buffer)))
   (redisplay t))
 
-(defun my-coq--result-at-target (target-point &optional forced-error initial-locked-end)
+(defun my-coq--result-at-target
+    (target-point &optional forced-error initial-locked-end shell-output-start)
   "Return API result plist based on TARGET-POINT in current buffer.
 When FORCED-ERROR is non-nil, always return an error plist.
 INITIAL-LOCKED-END is the checked frontier before the current `proof-goto-point'
 attempt.  When TARGET-POINT is behind that frontier, Proof General retracts to
 the nearest command boundary at or before TARGET-POINT, so success is
-`locked-end <= TARGET-POINT' rather than `locked-end >= TARGET-POINT'."
+`locked-end <= TARGET-POINT' rather than `locked-end >= TARGET-POINT'.
+SHELL-OUTPUT-START bounds the shell transcript region used for `:messages'."
   (let* ((locked-end (if (fboundp 'proof-unprocessed-begin)
                          (proof-unprocessed-begin)
                        (point-min)))
@@ -918,9 +969,14 @@ the nearest command boundary at or before TARGET-POINT, so success is
      ((eq output-kind 'interrupt)
       (my-coq--interrupted-result locked-end target-point))
      (failed
-      (let ((error-text (or (my-coq--last-error-string t)
-                            "Unknown Coq error"))
-            (goal-text (my-coq--goals-string)))
+      (rocqagent--set-subphase 'messages t)
+      (rocqagent--touch-status 'running)
+      (let ((message-text (my-coq--last-message-string shell-output-start))
+            (error-text (or (my-coq--last-error-string t)
+                            "Unknown Coq error")))
+        (rocqagent--set-subphase 'goals t)
+        (rocqagent--touch-status 'running)
+        (let ((goal-text (my-coq--goals-string)))
         (append
          (list :ok nil
                :error (if (or forced-error
@@ -930,16 +986,25 @@ the nearest command boundary at or before TARGET-POINT, so success is
                                 locked-end target-point))
                :locked-end locked-end
                :target target-point)
+         (when message-text
+           (list :messages message-text))
          (when goal-text
-           (list :goal goal-text)))))
+           (list :goal goal-text))))))
      (t
-      (let ((goal-text (my-coq--goals-string)))
+      (rocqagent--set-subphase 'messages t)
+      (rocqagent--touch-status 'running)
+      (let ((message-text (my-coq--last-message-string shell-output-start)))
+        (rocqagent--set-subphase 'goals t)
+        (rocqagent--touch-status 'running)
+        (let ((goal-text (my-coq--goals-string)))
         (append
          (list :ok t
                :locked-end locked-end
                :target target-point)
+         (when message-text
+           (list :messages message-text))
          (when goal-text
-           (list :goal goal-text))))))))
+           (list :goal goal-text)))))))))
 
 (defun my-coq--response-string ()
   "Return plain-text contents of `proof-response-buffer'."
@@ -1000,7 +1065,8 @@ the nearest command boundary at or before TARGET-POINT, so success is
                      (proof-auto-action-when-deactivating-scripting 'retract)
                      (restart-result nil)
                      (preserved-session nil)
-                     (initial-locked-end nil))
+                     (initial-locked-end nil)
+                     (shell-output-start nil))
                  (rocqagent--claim-process-thread)
                  (rocqagent--maybe-handle-cancel buf)
                  (when (and (boundp 'proof-shell-busy) proof-shell-busy
@@ -1013,6 +1079,7 @@ the nearest command boundary at or before TARGET-POINT, so success is
                           linenum columnnum))
                    (setq rocqagent--active-target target-point)
                    (rocqagent--recover-after-interrupt-if-needed buf)
+                   (setq shell-output-start (rocqagent--proof-shell-end))
                    (setq initial-locked-end
                          (if (fboundp 'proof-unprocessed-begin)
                              (proof-unprocessed-begin)
@@ -1042,6 +1109,7 @@ the nearest command boundary at or before TARGET-POINT, so success is
                                  (if (fboundp 'proof-unprocessed-begin)
                                      (proof-unprocessed-begin)
                                    (point-min)))
+                           (setq shell-output-start (rocqagent--proof-shell-end))
                            (unless (= target-point (proof-unprocessed-begin))
                              (my-coq--goto-safe-processing-point target-point)
                              (proof-goto-point)
@@ -1056,8 +1124,7 @@ the nearest command boundary at or before TARGET-POINT, so success is
                                   (fboundp 'proof-shell-wait))
                          (my-coq--wait-for-proof-shell-with-ui buf)))))
                  (when (plist-get (or restart-result '(:ok t)) :ok)
-                   (setq rocqagent--needs-recovery-after-interrupt nil)
-                   (rocqagent--clear-shell-result-state))
+                   (setq rocqagent--needs-recovery-after-interrupt nil))
                  (if (and restart-result
                           (not (plist-get restart-result :ok)))
                      (append
@@ -1066,11 +1133,16 @@ the nearest command boundary at or before TARGET-POINT, so success is
                                             (proof-unprocessed-begin)
                                           (point-min))
                             :target target-point))
-                   (my-coq--result-at-target
-                    target-point
-                    (and (not reuse)
-                         (not (my-coq--coq-active-buffer-p buf)))
-                    initial-locked-end)))))))
+                   (let ((check-result
+                          (my-coq--result-at-target
+                           target-point
+                           (and (not reuse)
+                                (not (my-coq--coq-active-buffer-p buf)))
+                           initial-locked-end
+                           shell-output-start)))
+                     (when (plist-get check-result :ok)
+                       (rocqagent--clear-shell-result-state))
+                     check-result)))))))
       (rocqagent-interrupted
        (let ((buf (get-file-buffer file)))
          (rocqagent--note-interrupted-buffer buf))
@@ -1095,12 +1167,13 @@ Arguments:
 - RESTART: when non-nil, force full restart path.
 
 Return shape:
-- success: (:ok t :locked-end INT :target INT [:goal STRING])
-- failure: (:ok nil :error STRING :locked-end INT :target INT [:goal STRING])
+- success: (:ok t :locked-end INT :target INT [:messages STRING] [:goal STRING])
+- failure: (:ok nil :error STRING :locked-end INT :target INT [:messages STRING] [:goal STRING])
 
 If processing fails at or before the requested point, this returns
-an error plist instead of a success plist.  `:goal' is included only
-when a proof is currently active and a fresh goal is available."
+an error plist instead of a success plist.  `:messages' is included
+when the current check printed Rocq info messages.  `:goal' is included
+only when a proof is currently active and a fresh goal is available."
   (interactive "fFile: \nnLine (1-based): \nnColumn (0-based): \nP")
   (let* ((file (expand-file-name filename))
          (buf (or (get-file-buffer file) (find-file-noselect file)))
