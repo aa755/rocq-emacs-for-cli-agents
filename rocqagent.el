@@ -712,45 +712,87 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
          (1- clamped)
        clamped))))
 
-(defun my-coq--proof-active-p ()
-  "Return non-nil when the current scripting state is inside an open proof."
+(defun my-coq--scripting-session-active-p ()
+  "Return non-nil when the current buffer has an active Rocq scripting session."
   (and (eq major-mode 'coq-mode)
        (boundp 'proof-script-buffer)
        (eq proof-script-buffer (current-buffer))
+       (boundp 'proof-shell-buffer)
        (buffer-live-p proof-shell-buffer)
-       (numberp proof-nesting-depth)
-       (> proof-nesting-depth 0)))
+       (boundp 'proof-shell-busy)
+       (not proof-shell-busy)))
+
+(defun rocqagent--snapshot-shell-result-state ()
+  "Capture Proof General output variables that diagnostic queries mutate."
+  (list :last-output-kind
+        (and (boundp 'proof-shell-last-output-kind)
+             proof-shell-last-output-kind)
+        :last-output
+        (and (boundp 'proof-shell-last-output)
+             proof-shell-last-output)
+        :interrupt-pending
+        (and (boundp 'proof-shell-interrupt-pending)
+             proof-shell-interrupt-pending)
+        :response-live (buffer-live-p proof-response-buffer)
+        :response-text
+        (when (buffer-live-p proof-response-buffer)
+          (with-current-buffer proof-response-buffer
+            (buffer-substring-no-properties (point-min) (point-max))))))
+
+(defun rocqagent--restore-shell-result-state (state)
+  "Restore Proof General output variables captured in STATE."
+  (when (boundp 'proof-shell-last-output-kind)
+    (setq proof-shell-last-output-kind
+          (plist-get state :last-output-kind)))
+  (when (boundp 'proof-shell-last-output)
+    (setq proof-shell-last-output
+          (plist-get state :last-output)))
+  (when (boundp 'proof-shell-interrupt-pending)
+    (setq proof-shell-interrupt-pending
+          (plist-get state :interrupt-pending)))
+  (when (and (plist-get state :response-live)
+             (buffer-live-p proof-response-buffer))
+    (with-current-buffer proof-response-buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (or (plist-get state :response-text) ""))))))
 
 (defun my-coq--goals-string ()
-  "Return plain-text goal buffer contents for the current active proof, or nil."
-  (when (my-coq--proof-active-p)
-    (let ((goals
-           (if (buffer-live-p proof-goals-buffer)
-               (with-current-buffer proof-goals-buffer
-                 (string-trim
-                  (buffer-substring-no-properties (point-min) (point-max))))
-             "")))
-      (if (> (length goals) 0)
-          goals
-        (condition-case _err
-            (let* ((raw (and (fboundp 'proof-shell-invisible-command)
-                             (my-coq--run-invisible-command-with-ui
-                              "Show."
-                              'no-response-display
-                              'no-error-display)))
-                   (plain (if (and (stringp raw)
-                                   (fboundp 'proof-shell-strip-output-markup))
-                              (proof-shell-strip-output-markup raw)
-                            raw))
-                   (trimmed (if (stringp plain)
-                                (string-trim plain)
-                              "")))
-              (unless (or (= (length trimmed) 0)
-                          (string-match-p "This command requires an open proof\\." trimmed))
-                trimmed))
-          (error nil))))))
+  "Return plain-text goals reported by Rocq, or nil outside an active proof.
 
-(defun my-coq--last-error-string ()
+Proof General's `proof-nesting-depth' can be stale after retraction, so use
+Rocq's response to `Show.' as the authority.  Restore PG's output variables so
+this diagnostic query cannot change the enclosing check result."
+  (when (and (my-coq--scripting-session-active-p)
+             (fboundp 'proof-shell-invisible-command))
+    (let ((state (rocqagent--snapshot-shell-result-state))
+          (restore t))
+      (unwind-protect
+          (condition-case err
+              (let* ((raw (my-coq--run-invisible-command-with-ui
+                           "Show."
+                           'no-response-display
+                           'no-error-display))
+                     (plain (if (and (stringp raw)
+                                     (fboundp 'proof-shell-strip-output-markup))
+                                (proof-shell-strip-output-markup raw)
+                              raw))
+                     (trimmed (if (stringp plain)
+                                  (string-trim plain)
+                                "")))
+                (unless (or (= (length trimmed) 0)
+                            (string-match-p
+                             "This command requires an open proof\\."
+                             trimmed))
+                  trimmed))
+            (rocqagent-interrupted
+             (setq restore nil)
+             (signal (car err) (cdr err)))
+            (error nil))
+        (when restore
+          (rocqagent--restore-shell-result-state state))))))
+
+(defun my-coq--last-error-string (&optional include-history)
   "Return best-effort plain-text error output."
   (cl-labels
       ((extract-error (text)
@@ -786,7 +828,8 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
                  (or (extract-error response-text)
                      (and (> (length response-text) 0) response-text))))
            (shell-buffer-text
-            (when (buffer-live-p proof-shell-buffer)
+            (when (and include-history
+                       (buffer-live-p proof-shell-buffer))
               (with-current-buffer proof-shell-buffer
                 (string-trim
                  (buffer-substring-no-properties (point-min) (point-max))))))
@@ -795,7 +838,8 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
                  (or (extract-error shell-buffer-text)
                      (and (> (length shell-buffer-text) 0) shell-buffer-text))))
            (dune-text
-            (when (get-buffer "*compile-deps-dune*")
+            (when (and include-history
+                       (get-buffer "*compile-deps-dune*"))
               (with-current-buffer "*compile-deps-dune*"
                 (string-trim
                  (buffer-substring-no-properties (point-min) (point-max))))))
@@ -866,33 +910,36 @@ the nearest command boundary at or before TARGET-POINT, so success is
                        (< target-point initial-locked-end))
                   (<= locked-end target-point)
                 (>= locked-end target-point))))
-         (error-text (or (my-coq--last-error-string) "Unknown Coq error"))
-         (goal-text (my-coq--goals-string)))
+         (output-kind (and (boundp 'proof-shell-last-output-kind)
+                           proof-shell-last-output-kind))
+         (failed (or forced-error
+                     (not target-reached))))
     (cond
-     ((eq proof-shell-last-output-kind 'interrupt)
+     ((eq output-kind 'interrupt)
       (my-coq--interrupted-result locked-end target-point))
-     ((or forced-error
-          (eq proof-shell-last-output-kind 'error)
-          (not target-reached))
-      (append
-       (list :ok nil
-             :error (if (or forced-error
-                            (eq proof-shell-last-output-kind 'error)
-                            (not (string= error-text "Unknown Coq error")))
-                        error-text
-                      (format "Coq stopped before target (%d < %d)"
-                              locked-end target-point))
-             :locked-end locked-end
-             :target target-point)
-       (when goal-text
-         (list :goal goal-text))))
+     (failed
+      (let ((error-text (or (my-coq--last-error-string t)
+                            "Unknown Coq error"))
+            (goal-text (my-coq--goals-string)))
+        (append
+         (list :ok nil
+               :error (if (or forced-error
+                              (not (string= error-text "Unknown Coq error")))
+                          error-text
+                        (format "Coq stopped before target (%d < %d)"
+                                locked-end target-point))
+               :locked-end locked-end
+               :target target-point)
+         (when goal-text
+           (list :goal goal-text)))))
      (t
-      (append
-       (list :ok t
-             :locked-end locked-end
-             :target target-point)
-       (when goal-text
-         (list :goal goal-text)))))))
+      (let ((goal-text (my-coq--goals-string)))
+        (append
+         (list :ok t
+               :locked-end locked-end
+               :target target-point)
+         (when goal-text
+           (list :goal goal-text))))))))
 
 (defun my-coq--response-string ()
   "Return plain-text contents of `proof-response-buffer'."
