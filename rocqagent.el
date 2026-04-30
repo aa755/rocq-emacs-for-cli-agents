@@ -768,28 +768,68 @@ LINE is 1-based and COLUMN is 0-based. If both are nil/None-like, return EOF."
     (with-current-buffer proof-shell-buffer
       (point-max))))
 
-(defun rocqagent--infomessages-from-shell (&optional start)
-  "Return plain text from `<infomsg>' blocks in the shell after START."
-  (when (and (boundp 'proof-shell-buffer)
-             (buffer-live-p proof-shell-buffer))
-    (let ((raw (with-current-buffer proof-shell-buffer
-                 (buffer-substring-no-properties
-                  (or start (point-min))
-                  (point-max))))
-          (pos 0)
+(defun rocqagent--last-shell-sentence-output (raw)
+  "Return shell output for the last processed Rocq sentence in RAW."
+  (let ((prompt-starts nil)
+        (pos 0))
+    (while-let ((open (string-search "<prompt>" raw pos)))
+      (push open prompt-starts)
+      (setq pos (+ open (length "<prompt>"))))
+    (let* ((ordered (nreverse prompt-starts))
+           (last-prompt (car (last ordered)))
+           (last-prompt-end (and last-prompt
+                                 (string-search "</prompt>" raw last-prompt)))
+           (last-prompt-end (and last-prompt-end
+                                 (+ last-prompt-end (length "</prompt>"))))
+           (last-prompt-has-command
+            (and last-prompt-end
+                 (> (length (string-trim
+                             (substring raw last-prompt-end)))
+                    0)))
+           (previous-prompt (unless last-prompt-has-command
+                              (car (last ordered 2))))
+           (previous-prompt-end (and previous-prompt
+                                     (string-search "</prompt>" raw
+                                                    previous-prompt)))
+           (segment-start (if last-prompt-has-command
+                              last-prompt-end
+                            (and previous-prompt-end
+                                 (+ previous-prompt-end
+                                    (length "</prompt>")))))
+           (segment-end (if last-prompt-has-command
+                            (length raw)
+                          (or last-prompt (length raw)))))
+      (when (and segment-start (<= segment-start segment-end))
+        (substring raw segment-start segment-end)))))
+
+(defun rocqagent--infomessages-from-text (text)
+  "Return plain text from `<infomsg>' blocks in TEXT."
+  (when text
+    (let ((pos 0)
           (messages nil))
-      (while-let ((open (string-search "<infomsg>" raw pos)))
+      (while-let ((open (string-search "<infomsg>" text pos)))
         (let* ((body-start (+ open (length "<infomsg>")))
-               (close (string-search "</infomsg>" raw body-start)))
+               (close (string-search "</infomsg>" text body-start)))
           (if close
               (let ((plain (string-trim
-                            (substring raw body-start close))))
+                            (substring text body-start close))))
                 (when (and plain (> (length plain) 0))
                   (push plain messages))
                 (setq pos (+ close (length "</infomsg>"))))
-            (setq pos (length raw)))))
+            (setq pos (length text)))))
       (when messages
         (string-join (nreverse messages) "\n")))))
+
+(defun rocqagent--last-sentence-infomessages-from-shell (&optional start)
+  "Return info messages from the last Rocq sentence processed after START."
+  (when (and (boundp 'proof-shell-buffer)
+             (buffer-live-p proof-shell-buffer))
+    (let* ((raw (with-current-buffer proof-shell-buffer
+                  (buffer-substring-no-properties
+                   (or start (point-min))
+                   (point-max))))
+           (last-output (rocqagent--last-shell-sentence-output raw)))
+      (rocqagent--infomessages-from-text last-output))))
 
 (defun my-coq--last-message-string (&optional shell-start)
   "Return info messages printed by the current Rocq check, if any.
@@ -803,7 +843,8 @@ commands overwrite Proof General's last-output variables."
               (not (string-match-p
                     "\\`\\(Error:\\|Anomaly:\\|Exception:\\)"
                     text)))))
-    (let ((info-text (rocqagent--infomessages-from-shell shell-start)))
+    (let ((info-text
+           (rocqagent--last-sentence-infomessages-from-shell shell-start)))
       (and (non-error-output-p info-text) info-text))))
 
 (defun my-coq--goals-string ()

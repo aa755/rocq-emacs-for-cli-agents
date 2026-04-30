@@ -34,8 +34,8 @@ The supported `ELISP` payloads for `rocqagent-call` are:
 - `'(coqquery_at_curpoint QUERY FILENAME)'`
 - `'(save-file FILENAME)'`
 
-`coqcheck_until` returns `:messages` when the current check printed Rocq info
-messages. It returns `:goal` only when a proof is currently active.
+`coqcheck_until` returns `:messages` when the last processed Rocq sentence
+printed info messages. It returns `:goal` only when a proof is currently active.
 On proof errors it includes both `:error` and the fresh current `:goal` when
 available. Outside an active proof it omits `:goal` rather than returning stale
 goal text or a `Show.` error.
