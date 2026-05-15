@@ -130,13 +130,7 @@ should have been checked incrementally through the live Emacs session.
 
 Example project setup:
 
-```sh
-mkdir -p PROJECT_ROOT/.codex/hooks
-ln -s /home/abhishek/fv-workspace/rocq-emacs-for-cli-agents/skills/rocqemacs/scripts/rocq-dune-gate \
-  PROJECT_ROOT/.codex/hooks/rocq-dune-gate
-```
-
-Then add this to `PROJECT_ROOT/.codex/hooks.json`:
+Add this to `PROJECT_ROOT/.codex/hooks.json`:
 
 ```json
 {
@@ -147,19 +141,7 @@ Then add this to `PROJECT_ROOT/.codex/hooks.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "ROCQ_DUNE_GATE_WORKSPACE=/absolute/path/to/PROJECT_ROOT python3 /absolute/path/to/PROJECT_ROOT/.codex/hooks/rocq-dune-gate pre",
-            "timeoutSec": 10
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "^Bash$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "ROCQ_DUNE_GATE_WORKSPACE=/absolute/path/to/PROJECT_ROOT python3 /absolute/path/to/PROJECT_ROOT/.codex/hooks/rocq-dune-gate post",
+            "command": "python3 /home/abhishek/fv-workspace/rocq-emacs-for-cli-agents/skills/rocqemacs/scripts/rocq-dune-block-all",
             "timeoutSec": 10
           }
         ]

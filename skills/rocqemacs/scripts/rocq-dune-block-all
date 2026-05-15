@@ -17,17 +17,36 @@ ERROR = (
 )
 
 
+def command_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return (
+            command.replace(";", " ")
+            .replace("|", " ")
+            .replace("&", " ")
+            .replace("(", " ")
+            .replace(")", " ")
+            .split()
+        )
+
+
 def main() -> int:
-    payload = json.load(sys.stdin)
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return 0
+
     tool_input = payload.get("tool_input") or {}
     command = ""
     if isinstance(tool_input, dict):
         command = tool_input.get("command") or tool_input.get("cmd") or ""
+    if not isinstance(command, str):
+        return 0
 
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
-    lexer.whitespace_split = True
-
-    if any(Path(token).name == "dune" for token in lexer):
+    if any(Path(token).name == "dune" for token in command_tokens(command)):
         print(ERROR, file=sys.stderr)
         return 2
     return 0
